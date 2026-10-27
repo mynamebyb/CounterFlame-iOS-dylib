@@ -1,0 +1,48 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 缓存 Theos
+        id: cache-theos
+        uses: actions/cache@v4
+        with:
+          path: ~/theos
+          key: theos-v2
+
+      - name: 安装 Theos
+        if: steps.cache-theos.outputs.cache-hit != 'true'
+        run: |
+          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+
+      - name: 编译
+        run: |
+          export THEOS="$HOME/theos"
+          make clean
+          make
+          ls -la .theos/obj/debug/
+
+      - name: 导出成品
+        run: |
+          cp .theos/obj/debug/libCounterFlameTool.dylib CounterFlameTool.dylib
+
+      - name: 校验架构与依赖
+        run: |
+          file CounterFlameTool.dylib
+          lipo -info CounterFlameTool.dylib
+          otool -L CounterFlameTool.dylib || true
+
+      - name: 上传 dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: CounterFlameTool.dylib
+          path: CounterFlameTool.dylib
