@@ -590,7 +590,7 @@ static void CFTSetupButton(void) {
     [gBtn addSubview:lab];
 
     gController = [CFTController new];
-    UITapGestureRecognizer *tap = [[UITAPGestureRecognizer alloc] initWithTarget:gController
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:gController
                                                                           action:@selector(onTap)];
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:gController
                                                                           action:@selector(onPan:)];
