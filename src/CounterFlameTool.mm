@@ -353,6 +353,7 @@ static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt)
 
 #pragma mark - ESP 覆盖视图
 
+@class CFTOverlayView;
 static UIWindow *gOverlayWindow;
 static CFTOverlayView *gOverlayView;
 
@@ -476,6 +477,7 @@ static void CFTSelectTarget(CFTTarget *tt) {
 
 #pragma mark - 菜单 / 悬浮按钮
 
+@class CFTController;
 static UIWindow *gBtnWindow;
 static UIView *gBtn;
 static CFTController *gController;
