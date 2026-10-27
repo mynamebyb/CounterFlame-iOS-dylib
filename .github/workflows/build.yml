@@ -24,6 +24,10 @@ jobs:
         run: |
           git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
 
+      - name: 安装 ldid
+        run: |
+          if ! command -v ldid >/dev/null; then brew install ldid; fi
+
       - name: 编译
         run: |
           export THEOS="$HOME/theos"
