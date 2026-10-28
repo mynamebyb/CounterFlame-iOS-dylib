@@ -5,9 +5,13 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: macos-13
+    runs-on: macos-14
     steps:
       - name: 检出
         uses: actions/checkout@v4
