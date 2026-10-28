@@ -570,6 +570,10 @@ static void CFTSelectTarget(CFTTarget *tt) {
 
 @implementation CFTSwitch
 
+@synthesize on = _on;
+@synthesize changed = _changed;
+@synthesize knob = _knob;
+
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
@@ -925,8 +929,8 @@ static void CFTSetupButton(void) {
                                                                           action:@selector(onTap)];
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:ctl
                                                                           action:@selector(onPan:)];
-    [gBtn addGestureRecognizer:tap];
-    [gBtn addGestureRecognizer:pan];
+    [gBtn addSubview:tap];
+    [gBtn addSubview:pan];
 
     UIViewController *vc = [UIViewController new];
     vc.view = gBtn;
