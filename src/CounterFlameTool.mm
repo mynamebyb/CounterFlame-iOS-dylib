@@ -1,7 +1,8 @@
 //
 //  CounterFlameTool.mm — CounterFlame 内部测试工具（standalone 注入 dylib）
 //
-//  精简重写：UIKit 暗色菜单 + 标准 il2cpp 反射 API（runtime_invoke），防御性判空。
+//  v2：安卓 libtool 风格实色面板（无液态玻璃）；修复触控穿透、选类闪退；
+//  选类自动获取类/对象/摄像机；绘制总开关默认关。
 //  arm64 / arm64e 通用 fat dylib。
 //
 
@@ -44,11 +45,30 @@ static const Il2CppType* (*fn_class_get_type)(Il2CppClass*);
 static uint32_t     (*fn_class_get_num_methods)(Il2CppClass*);
 static Il2CppClass*  (*fn_object_get_class)(Il2CppObject*);
 static int32_t      (*fn_array_length)(Il2CppArray*);
+static void*        (*fn_array_addr_with_size)(Il2CppArray*, uint32_t, uint32_t);
 static int          (*fn_class_is_assignable_from)(Il2CppClass*, Il2CppClass*);
 static Il2CppString* (*fn_string_new)(const char*);
 static void*        (*fn_resolve_icall)(const char*);
 static Il2CppObject* (*fn_runtime_invoke)(const MethodInfo*, void*, void**, Il2CppException**);
 static void*        (*fn_object_unbox)(Il2CppObject*);
+static Il2CppObject* (*fn_type_get_object)(const Il2CppType*);
+
+#pragma mark - 颜色（实色，无透明毛玻璃）
+
+static UIColor* CFTHex(unsigned int rgb, CGFloat a) {
+    return [UIColor colorWithRed:((rgb >> 16) & 0xFF)/255.0
+                           green:((rgb >> 8) & 0xFF)/255.0
+                            blue:(rgb & 0xFF)/255.0 alpha:a];
+}
+#define kCFTBg      CFTHex(0x0E1013, 0.98)   // 面板底
+#define kCFTBar     CFTHex(0x171A1F, 1.0)    // 标题栏
+#define kCFTLine    CFTHex(0x2B3038, 1.0)    // 边框/分隔
+#define kCFTBtn     CFTHex(0x1A1E23, 1.0)    // 按钮底
+#define kCFTBtnHi   CFTHex(0x23282F, 1.0)    // 按钮按下
+#define kCFTText    CFTHex(0xE6E8EB, 1.0)    // 主文字
+#define kCFTSUB     CFTHex(0x8A9099, 1.0)    // 次文字
+#define kCFTAccent  CFTHex(0xFF720F, 1.0)    // 品牌橙
+#define kCFTOff     CFTHex(0x262B33, 1.0)    // 开关关底
 
 #pragma mark - 日志
 
@@ -83,7 +103,7 @@ static void CFTLog(NSString *fmt, ...) {
     } @catch (__unused NSException *e) {}
 }
 
-#pragma mark - 全局状态
+#pragma mark - 全局状态（绘制默认全关）
 
 static BOOL gReady = NO;
 static Il2CppDomain *gDomain;
@@ -92,6 +112,8 @@ static Il2CppClass *gComponentClass;
 static Il2CppClass *gTransformClass;
 static Il2CppClass *gCameraClass;
 static MethodInfo *gFindObjectsOfType;
+static MethodInfo *gFindObjectsByType;
+static MethodInfo *gTypeGetTypeFromHandle;
 static MethodInfo *gGetTransform;
 static MethodInfo *gGetPosition;
 static MethodInfo *gCameraGetMain;
@@ -101,9 +123,10 @@ static Il2CppObject *gMainCamera;
 
 static NSString *gCurrentClassName = nil;
 static NSString *gCurrentComment = nil;
-static BOOL gShowBox = YES;
-static BOOL gShowName = YES;
-static BOOL gShowDistance = YES;
+static BOOL gDrawEnabled = NO;   // 绘制总开关，默认关
+static BOOL gShowBox = NO;
+static BOOL gShowName = NO;
+static BOOL gShowDistance = NO;
 static BOOL gShowRay = NO;
 
 #pragma mark - 固定类配置
@@ -144,6 +167,10 @@ static NSArray<CFTTarget*>* CFTTargets(void) {
 
 #pragma mark - 反射辅助
 
+static void CFTAttach(void) {
+    if (fn_thread_attach && gDomain) fn_thread_attach(gDomain);
+}
+
 static Il2CppObject* CFTInvoke(const MethodInfo *m, void *obj, void **params) {
     if (!m || !fn_runtime_invoke) return NULL;
     Il2CppException *exc = NULL;
@@ -180,6 +207,29 @@ static Il2CppClass* CFTFindGameClass(CFTTarget *tt) {
     return NULL;
 }
 
+// Il2CppType* -> C# System.Type 对象（FindObjectsOfType 需要的是对象，不是裸元数据指针）
+static Il2CppObject* CFTTypeObject(const Il2CppType *t) {
+    if (!t) return NULL;
+    if (fn_type_get_object) return fn_type_get_object(t);
+    if (gTypeGetTypeFromHandle) {
+        // 兜底：Type.GetTypeFromHandle(RuntimeTypeHandle)，handle 内部值即 Il2CppType*
+        void *handle = (void*)t;
+        return CFTInvoke(gTypeGetTypeFromHandle, NULL, &handle);
+    }
+    return NULL;
+}
+
+// 安全取数组元素：il2cpp 数组头部 32 字节，不能直接把数组指针当数据区
+static Il2CppObject* CFTArrayElem(Il2CppArray *arr, int32_t idx) {
+    if (!arr) return NULL;
+    if (fn_array_addr_with_size) {
+        void **slot = (void**)fn_array_addr_with_size(arr, (uint32_t)sizeof(void*),
+                                                      (uint32_t)idx);
+        return slot ? *slot : NULL;
+    }
+    return ((Il2CppObject**)((char*)arr + 0x20))[idx];
+}
+
 #pragma mark - 初始化
 
 static void CFTResolve(void* *ptr, const char *name) {
@@ -189,6 +239,7 @@ static void CFTResolve(void* *ptr, const char *name) {
 
 static void CFTInit(void) {
     if (gReady) return;
+    CFTAttach();
 
     CFTResolve((void**)&fn_domain_get, "il2cpp_domain_get");
     CFTResolve((void**)&fn_thread_attach, "il2cpp_thread_attach");
@@ -202,11 +253,13 @@ static void CFTInit(void) {
     CFTResolve((void**)&fn_class_get_num_methods, "il2cpp_class_get_num_methods");
     CFTResolve((void**)&fn_object_get_class, "il2cpp_object_get_class");
     CFTResolve((void**)&fn_array_length, "il2cpp_array_length");
+    CFTResolve((void**)&fn_array_addr_with_size, "il2cpp_array_addr_with_size");
     CFTResolve((void**)&fn_class_is_assignable_from, "il2cpp_class_is_assignable_from");
     CFTResolve((void**)&fn_string_new, "il2cpp_string_new");
     CFTResolve((void**)&fn_resolve_icall, "il2cpp_resolve_icall");
     CFTResolve((void**)&fn_runtime_invoke, "il2cpp_runtime_invoke");
     CFTResolve((void**)&fn_object_unbox, "il2cpp_object_unbox");
+    CFTResolve((void**)&fn_type_get_object, "il2cpp_type_get_object");
 
     if (!fn_domain_get || !fn_thread_attach) {
         CFTLog(@"缺少核心 il2cpp 导出，终止");
@@ -214,7 +267,7 @@ static void CFTInit(void) {
     }
 
     gDomain = fn_domain_get();
-    if (fn_thread_attach) fn_thread_attach(gDomain);
+    CFTAttach();
     CFTLog(@"domain=%p thread 已 attach", gDomain);
 
     gUnityObjectClass = CFTFindUnityClass("UnityEngine", "Object");
@@ -227,6 +280,13 @@ static void CFTInit(void) {
     if (gUnityObjectClass) {
         gFindObjectsOfType = fn_class_get_method_from_name(gUnityObjectClass,
                                                             "FindObjectsOfType", 1);
+        gFindObjectsByType = fn_class_get_method_from_name(gUnityObjectClass,
+                                                            "FindObjectsByType", 2);
+    }
+    Il2CppClass *sysType = CFTFindUnityClass("System", "Type");
+    if (sysType) {
+        gTypeGetTypeFromHandle = fn_class_get_method_from_name(sysType,
+                                                               "GetTypeFromHandle", 1);
     }
     if (gComponentClass) {
         gGetTransform = fn_class_get_method_from_name(gComponentClass, "get_transform", 0);
@@ -241,8 +301,9 @@ static void CFTInit(void) {
                                                             "WorldToScreenPoint", 1);
     }
 
-    CFTLog(@"方法 Find=%p trans=%p pos=%p camMain=%p w2s=%p",
-           gFindObjectsOfType, gGetTransform, gGetPosition, gCameraGetMain, gWorldToScreenPoint);
+    CFTLog(@"方法 Find=%p FindByType=%p trans=%p pos=%p camMain=%p w2s=%p typeObj=%p",
+           gFindObjectsOfType, gFindObjectsByType, gGetTransform, gGetPosition,
+           gCameraGetMain, gWorldToScreenPoint, fn_type_get_object);
 
     gReady = (gDomain != NULL);
     CFTLog(@"初始化完成 ready=%d", gReady);
@@ -271,13 +332,31 @@ static void CFTGetCamera(void) {
 
 static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt) {
     NSMutableArray *items = [NSMutableArray array];
-    if (!gReady || !targetClass || !gFindObjectsOfType) return items;
+    if (!gReady || !targetClass) return items;
 
     const Il2CppType *type = fn_class_get_type ? fn_class_get_type(targetClass) : NULL;
-    void *typeArg = (void*)type;
-    Il2CppObject *arrObj = CFTInvoke(gFindObjectsOfType, NULL, &typeArg);
+    Il2CppObject *typeObj = CFTTypeObject(type);
+    if (!typeObj) {
+        CFTLog(@"无法取得 System.Type 对象，放弃本次扫描");
+        return items;
+    }
+
+    Il2CppObject *arrObj = NULL;
+    if (gFindObjectsOfType) {
+        void *p0 = typeObj;
+        arrObj = CFTInvoke(gFindObjectsOfType, NULL, &p0);
+    } else if (gFindObjectsByType) {
+        // 新 Unity：FindObjectsByType(Type, FindObjectsSortMode)，sortMode=None(0)
+        void *p0 = typeObj;
+        int32_t mode = 0;
+        void *params[2] = { &p0, &mode };
+        arrObj = CFTInvoke(gFindObjectsByType, NULL, params);
+    } else {
+        CFTLog(@"无可用的对象查找方法");
+        return items;
+    }
     if (!arrObj) {
-        CFTLog(@"FindObjectsOfType 返回空");
+        CFTLog(@"对象查找返回空");
         return items;
     }
     Il2CppArray *arr = (Il2CppArray*)arrObj;
@@ -301,7 +380,7 @@ static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt)
     CGFloat screenW = UIScreen.mainScreen.bounds.size.width;
 
     for (int32_t i = 0; i < n; i++) {
-        Il2CppObject *elem = ((Il2CppObject**)arr)[i];
+        Il2CppObject *elem = CFTArrayElem(arr, i);
         if (!elem) continue;
 
         Il2CppObject *transform = NULL;
@@ -328,7 +407,6 @@ static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt)
             void *argp = &arg;
             Il2CppObject *sb = CFTInvoke(gWorldToScreenPoint, cam, &argp);
             if (sb) {
-                // WorldToScreenPoint 返回 Vector3（z 为距离），取前两个 float
                 struct CFT_Vec3 *sp = (struct CFT_Vec3*)fn_object_unbox(sb);
                 if (sp) {
                     CGFloat px = sp->x / scale;
@@ -351,7 +429,7 @@ static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt)
     return items;
 }
 
-#pragma mark - ESP 覆盖视图
+#pragma mark - ESP 覆盖视图（纯绘制，不接收触摸）
 
 @class CFTOverlayView;
 static UIWindow *gOverlayWindow;
@@ -379,10 +457,11 @@ static CFTOverlayView *gOverlayView;
 }
 
 - (void)drawRect:(CGRect)rect {
+    if (!gDrawEnabled) return;   // 总开关关：什么都不画
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (!ctx) return;
 
-    UIColor *accent = [UIColor colorWithRed:1.0 green:0.45 blue:0.05 alpha:1.0];
+    UIColor *accent = kCFTAccent;
 
     for (CFTItem *it in self.items) {
         if (!it.valid) continue;
@@ -430,7 +509,7 @@ static void CFTSetupOverlay(void) {
     gOverlayView = [[CFTOverlayView alloc] initWithFrame:gOverlayWindow.bounds];
     gOverlayWindow.rootViewController = [UIViewController new];
     [gOverlayWindow.rootViewController.view addSubview:gOverlayView];
-    gOverlayWindow.hidden = NO;
+    gOverlayWindow.hidden = !gDrawEnabled;
 }
 
 #pragma mark - 扫描定时
@@ -438,14 +517,14 @@ static void CFTSetupOverlay(void) {
 static NSTimer *gScanTimer;
 
 static void CFTRefreshScan(void) {
-    if (!gReady || !gCurrentClassName) return;
+    if (!gReady || !gDrawEnabled || !gCurrentClassName) return;
     CFTTarget *tt = nil;
     for (CFTTarget *t in CFTTargets()) {
         if ([t.fullName isEqualToString:gCurrentClassName]) { tt = t; break; }
     }
     if (!tt) return;
 
-    Il2CppClass *cls = CFTFindGameClass(tt);
+    Il2CppClass *cls = CFTFindGameClass(tt);   // 每轮重新获取类
     if (!cls) {
         CFTLog(@"未找到类 %@", tt.fullName);
         return;
@@ -453,21 +532,27 @@ static void CFTRefreshScan(void) {
     NSArray<CFTItem*> *items = CFTBuildItems(cls, tt);
     dispatch_async(dispatch_get_main_queue(), ^{
         CFTSetupOverlay();
+        gOverlayWindow.hidden = NO;
         gOverlayView.items = items;
     });
 }
 
 static void CFTSelectTarget(CFTTarget *tt) {
+    CFTAttach();
     CFTInit();
-    CFTGetCamera();
+    CFTGetCamera();                              // 点类名同时自动重新获取摄像机
     gCurrentClassName = tt.fullName;
     gCurrentComment = tt.comment;
-    CFTLog(@"选择类 %@（%@），重新获取摄像机", tt.fullName, tt.comment);
+
+    Il2CppClass *cls = CFTFindGameClass(tt);     // 自动获取类与对象校验
+    CFTLog(@"选择类 %@（%@）类=%@ 摄像机=%p",
+           tt.fullName, tt.comment, cls ? @"已获取" : @"未找到", gMainCamera);
 
     if (!gScanTimer) {
         gScanTimer = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES
                                                         block:^(NSTimer *t) {
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                CFTAttach();                     // GCD 线程每次必须 attach
                 CFTRefreshScan();
             });
         }];
@@ -475,13 +560,317 @@ static void CFTSelectTarget(CFTTarget *tt) {
     CFTRefreshScan();
 }
 
-#pragma mark - 菜单 / 悬浮按钮
+#pragma mark - 矩形开关（安卓风格，非系统 UISwitch）
 
-@class CFTController;
+@interface CFTSwitch : UIControl
+@property(nonatomic, assign, getter=isOn) BOOL on;
+@property(nonatomic, copy) void (^changed)(BOOL on);
+@property(nonatomic, strong) UIView *knob;
+@end
+
+@implementation CFTSwitch
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.layer.cornerRadius = 3;
+        self.backgroundColor = kCFTOff;
+        CGFloat k = frame.size.height - 4;
+        _knob = [[UIView alloc] initWithFrame:CGRectMake(2, 2, k, k)];
+        _knob.backgroundColor = kCFTText;
+        _knob.layer.cornerRadius = 2;
+        [self addSubview:_knob];
+        [self addTarget:self action:@selector(didTap)
+                       forControlEvents:UIControlEventTouchUpInside];
+    }
+    return self;
+}
+
+- (void)applyVisual:(BOOL)animated {
+    void (^b)(void) = ^{
+        self.backgroundColor = self.on ? kCFTAccent : kCFTOff;
+        CGFloat k = self.frame.size.height - 4;
+        self.knob.frame = CGRectMake(self.on ? self.frame.size.width - k - 2 : 2,
+                                     2, k, k);
+    };
+    if (animated) [UIView animateWithDuration:0.12 animations:b]; else b();
+}
+
+- (void)setOn:(BOOL)on {
+    _on = on;
+    [self applyVisual:NO];
+}
+
+- (void)didTap {
+    _on = !_on;
+    [self applyVisual:YES];
+    if (self.changed) self.changed(_on);
+}
+
+@end
+
+#pragma mark - 菜单面板（独立窗口，整块可触控）
+
+static UIWindow *gMenuWindow;
+static UIView *gPanel;
+static NSMutableArray<UIButton*> *gClassButtons;
+static CFTSwitch *gSwDraw;
+static CFTSwitch *gSwBox;
+static CFTSwitch *gSwName;
+static CFTSwitch *gSwDist;
+static CFTSwitch *gSwRay;
+
+@interface CFTMenuController : NSObject
+- (void)onMenuPan:(UIPanGestureRecognizer*)gr;
+- (void)onMinimize;
+@end
+@implementation CFTMenuController
+
+- (void)onMenuPan:(UIPanGestureRecognizer*)gr {
+    UIWindow *win = gMenuWindow;
+    if (!win) return;
+    CGPoint t = [gr translationInView:win];
+    CGPoint c = win.center;
+    c.x += t.x; c.y += t.y;
+    CGRect sb = win.screen.bounds;
+    CGRect f = win.frame;
+    c.x = MAX(f.size.width/2, MIN(sb.size.width - f.size.width/2, c.x));
+    c.y = MAX(f.size.height/2, MIN(sb.size.height - f.size.height/2, c.y));
+    win.center = c;
+    [gr setTranslation:CGPointZero inView:win];
+}
+
+- (void)onMinimize {
+    gMenuWindow.hidden = YES;
+}
+
+@end
+static CFTMenuController *gMenuController;
+
+static UILabel* CFTMakeLabel(CGRect frame, NSString *text, UIColor *color,
+                             UIFontWeight w, CGFloat size) {
+    UILabel *l = [[UILabel alloc] initWithFrame:frame];
+    l.text = text;
+    l.textColor = color;
+    l.font = [UIFont systemFontOfSize:size weight:w];
+    return l;
+}
+
+static UIButton* CFTMakeRectButton(CGRect frame, NSString *title) {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.frame = frame;
+    b.layer.cornerRadius = 3;
+    b.layer.borderWidth = 1;
+    b.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+    [b setTitle:title forState:UIControlStateNormal];
+    [b setTitleColor:kCFTText forState:UIControlStateNormal];
+    b.backgroundColor = kCFTBtn;
+    b.layer.borderColor = kCFTLine.CGColor;
+    b.adjustsImageWhenHighlighted = NO;
+    b.showsTouchWhenHighlighted = NO;
+    return b;
+}
+
+static void CFTUpdateClassButtonStyles(void) {
+    NSArray *targets = CFTTargets();
+    for (NSUInteger i = 0; i < gClassButtons.count; i++) {
+        UIButton *b = gClassButtons[i];
+        BOOL sel = [targets[i].fullName isEqualToString:gCurrentClassName];
+        b.layer.borderColor = (sel ? kCFTAccent : kCFTLine).CGColor;
+        [b setTitleColor:(sel ? kCFTAccent : kCFTText) forState:UIControlStateNormal];
+        b.backgroundColor = sel ? CFTHex(0xFF720F, 0.14) : kCFTBtn;
+    }
+}
+
+static void CFTUpdateSubSwitches(void) {
+    NSArray *sub = @[gSwBox, gSwName, gSwDist, gSwRay];
+    for (CFTSwitch *s in sub) {
+        s.enabled = gDrawEnabled;
+        s.alpha = gDrawEnabled ? 1.0 : 0.35;
+    }
+}
+
+static void CFTMenuBuild(void) {
+    if (gMenuWindow) return;
+
+    const CGFloat W = 285, H = 446;
+    CGRect defaultFrame = CGRectMake(35, 90, W, H);
+
+    gMenuWindow = [[UIWindow alloc] initWithFrame:defaultFrame];
+    gMenuWindow.windowLevel = UIWindowLevelStatusBar + 400;
+    gMenuWindow.backgroundColor = UIColor.clearColor;
+
+    gPanel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, W, H)];
+    gPanel.backgroundColor = kCFTBg;
+    gPanel.layer.cornerRadius = 6;
+    gPanel.layer.borderWidth = 1;
+    gPanel.layer.borderColor = kCFTLine.CGColor;
+    gPanel.clipsToBounds = YES;
+
+    // 标题栏（可拖动）
+    UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, W, 36)];
+    bar.backgroundColor = kCFTBar;
+    UILabel *title = CFTMakeLabel(CGRectMake(12, 0, 200, 36),
+                                  @"CounterFlame", kCFTAccent,
+                                  UIFontWeightBold, 13);
+    [bar addSubview:title];
+
+    UIButton *min = [UIButton buttonWithType:UIButtonTypeCustom];
+    min.frame = CGRectMake(W - 44, 0, 44, 36);
+    [min setTitle:@"—" forState:UIControlStateNormal];
+    [min setTitleColor:kCFTSUB forState:UIControlStateNormal];
+    min.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightBold];
+    gMenuController = [CFTMenuController new];
+    [min addTarget:gMenuController action:@selector(onMinimize)
+                 forControlEvents:UIControlEventTouchUpInside];
+    [bar addSubview:min];
+
+    UIPanGestureRecognizer *mp = [[UIPanGestureRecognizer alloc]
+        initWithTarget:gMenuController action:@selector(onMenuPan:)];
+    [bar addGestureRecognizer:mp];
+    [gPanel addSubview:bar];
+
+    // 分组：目标类
+    [gPanel addSubview:CFTMakeLabel(CGRectMake(12, 44, 200, 12),
+                                    @"目标类（点击自动获取）", kCFTSUB,
+                                    UIFontWeightRegular, 11)];
+
+    gClassButtons = [NSMutableArray array];
+    NSArray *targets = CFTTargets();
+    for (NSUInteger i = 0; i < targets.count; i++) {
+        CFTTarget *tt = targets[i];
+        CGFloat y = 60 + i * 40;
+        UIButton *b = CFTMakeRectButton(CGRectMake(12, y, W - 24, 34),
+                                        [NSString stringWithFormat:@"%@  ·  %@",
+                                                 tt.comment, tt.cls]);
+        b.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+        b.titleEdgeInsets = UIEdgeInsetsMake(0, 10, 0, 0);
+        [b addTarget:b action:@selector(cft_classTapped:)
+                forControlEvents:UIControlEventTouchUpInside];
+        b.tag = (NSInteger)i;
+        [gPanel addSubview:b];
+        [gClassButtons addObject:b];
+    }
+
+    // 摄像机
+    UIButton *camBtn = CFTMakeRectButton(CGRectMake(12, 220, W - 24, 32),
+                                         @"重新获取摄像机");
+    [camBtn addTarget:camBtn action:@selector(cft_cameraTapped)
+                 forControlEvents:UIControlEventTouchUpInside];
+    [gPanel addSubview:camBtn];
+
+    // 分隔
+    UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(12, 260, W - 24, 1)];
+    sep.backgroundColor = kCFTLine;
+    [gPanel addSubview:sep];
+
+    [gPanel addSubview:CFTMakeLabel(CGRectMake(12, 268, 100, 12),
+                                    @"绘制", kCFTSUB,
+                                    UIFontWeightRegular, 11)];
+
+    // 开关行
+    NSArray *rows = @[
+        @[@"绘制总开关", @"draw"],
+        @[@"方框", @"box"],
+        @[@"名字", @"name"],
+        @[@"距离", @"dist"],
+        @[@"射线", @"ray"]
+    ];
+    NSMutableArray *sws = [NSMutableArray array];
+    for (NSUInteger i = 0; i < rows.count; i++) {
+        CGFloat y = 286 + i * 30;
+        [gPanel addSubview:CFTMakeLabel(CGRectMake(12, y, 160, 24),
+                                        rows[i][0], kCFTText,
+                                        UIFontWeightRegular, 12)];
+        CFTSwitch *sw = [[CFTSwitch alloc] initWithFrame:CGRectMake(W - 12 - 46,
+                                                                    y + 3, 46, 24)];
+        [gPanel addSubview:sw];
+        [sws addObject:sw];
+    }
+    gSwDraw = sws[0]; gSwBox = sws[1]; gSwName = sws[2];
+    gSwDist = sws[3]; gSwRay = sws[4];
+
+    gSwDraw.on = gDrawEnabled;
+    gSwBox.on = gShowBox; gSwName.on = gShowName;
+    gSwDist.on = gShowDistance; gSwRay.on = gShowRay;
+
+    gSwDraw.changed = ^(BOOL on) {
+        gDrawEnabled = on;
+        CFTSetupOverlay();
+        gOverlayWindow.hidden = !on;
+        if (!on) {
+            gOverlayView.items = @[];
+        } else {
+            [gOverlayView setNeedsDisplay];
+        }
+        CFTUpdateSubSwitches();
+    };
+    gSwBox.changed = ^(BOOL on) {
+        gShowBox = on; [gOverlayView setNeedsDisplay];
+    };
+    gSwName.changed = ^(BOOL on) {
+        gShowName = on; [gOverlayView setNeedsDisplay];
+    };
+    gSwDist.changed = ^(BOOL on) {
+        gShowDistance = on; [gOverlayView setNeedsDisplay];
+    };
+    gSwRay.changed = ^(BOOL on) {
+        gShowRay = on; [gOverlayView setNeedsDisplay];
+    };
+
+    CFTUpdateSubSwitches();
+    CFTUpdateClassButtonStyles();
+
+    UIViewController *vc = [UIViewController new];
+    vc.view = gPanel;
+    gMenuWindow.rootViewController = vc;
+}
+
+// 按钮事件（挂到 UIButton 上，需在类层级可见）
+@interface UIButton (CFTHandlers)
+- (void)cft_classTapped:(UIButton*)sender;
+- (void)cft_cameraTapped;
+@end
+@implementation UIButton (CFTHandlers)
+- (void)cft_classTapped:(UIButton*)sender {
+    NSArray *targets = CFTTargets();
+    if ((NSUInteger)sender.tag >= targets.count) return;
+    CFTTarget *tt = targets[sender.tag];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        CFTAttach();
+        CFTSelectTarget(tt);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            CFTUpdateClassButtonStyles();
+        });
+    });
+}
+- (void)cft_cameraTapped {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        CFTAttach();
+        CFTInit();
+        CFTGetCamera();
+    });
+}
+@end
+
+static void CFTMenuShow(void) {
+    CFTMenuBuild();
+    // 若 frame 超出屏幕（拖动过/旋转），回到默认位置
+    CGRect f = gMenuWindow.frame;
+    CGRect sb = UIScreen.mainScreen.bounds;
+    if (f.origin.x < 0 || f.origin.y < 0 ||
+        CGRectGetMaxX(f) > sb.size.width || CGRectGetMaxY(f) > sb.size.height) {
+        gMenuWindow.frame = CGRectMake(35, 90, f.size.width, f.size.height);
+    }
+    CFTUpdateClassButtonStyles();
+    CFTUpdateSubSwitches();
+    gMenuWindow.hidden = NO;
+}
+
+#pragma mark - 悬浮按钮
+
 static UIWindow *gBtnWindow;
 static UIView *gBtn;
-static CFTController *gController;
-static void CFTMenuShow(void);
 
 @interface CFTController : NSObject
 - (void)onTap;
@@ -490,7 +879,11 @@ static void CFTMenuShow(void);
 @implementation CFTController
 
 - (void)onTap {
-    CFTMenuShow();
+    if (gMenuWindow && !gMenuWindow.hidden) {
+        gMenuWindow.hidden = YES;
+    } else {
+        CFTMenuShow();
+    }
 }
 
 - (void)onPan:(UIPanGestureRecognizer*)gr {
@@ -508,70 +901,6 @@ static void CFTMenuShow(void);
 }
 @end
 
-static void CFTMenuShow(void) {
-    CFTInit();
-    UIViewController *top = NULL;
-    for (UIWindow *w in UIApplication.sharedApplication.windows) {
-        if (w.hidden) continue;
-        UIViewController *vc = w.rootViewController;
-        while (vc.presentedViewController) vc = vc.presentedViewController;
-        if (vc) { top = vc; break; }
-    }
-    if (!top) return;
-
-    UIAlertController *sheet = [UIAlertController
-        alertControllerWithTitle:@"CounterFlame 内部测试"
-        message:gCurrentClassName ? [NSString stringWithFormat:@"当前：%@", gCurrentComment] : nil
-        preferredStyle:UIAlertControllerStyleActionSheet];
-
-    [sheet addAction:[UIAlertAction actionWithTitle:@"获取摄像机"
-        style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT,0), ^{
-            CFTInit(); CFTGetCamera();
-        });
-    }]];
-
-    for (CFTTarget *tt in CFTTargets()) {
-        NSString *title = [NSString stringWithFormat:@"%@（%@）", tt.fullName, tt.comment];
-        [sheet addAction:[UIAlertAction actionWithTitle:title
-            style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT,0), ^{
-                CFTSelectTarget(tt);
-            });
-        }]];
-    }
-
-    [sheet addAction:[UIAlertAction actionWithTitle:
-        [NSString stringWithFormat:@"显示方框：%@", gShowBox ? @"开" : @"关"]
-        style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        gShowBox = !gShowBox;
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:
-        [NSString stringWithFormat:@"显示名字：%@", gShowName ? @"开" : @"关"]
-        style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        gShowName = !gShowName;
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:
-        [NSString stringWithFormat:@"显示距离：%@", gShowDistance ? @"开" : @"关"]
-        style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        gShowDistance = !gShowDistance;
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:
-        [NSString stringWithFormat:@"显示射线：%@", gShowRay ? @"开" : @"关"]
-        style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        gShowRay = !gShowRay;
-    }]];
-
-    [sheet addAction:[UIAlertAction actionWithTitle:@"关闭"
-        style:UIAlertActionStyleCancel handler:nil]];
-
-    if (sheet.popoverPresentationController) {
-        sheet.popoverPresentationController.sourceView = gBtn;
-        sheet.popoverPresentationController.sourceRect = gBtn.bounds;
-    }
-    [top presentViewController:sheet animated:YES completion:nil];
-}
-
 static void CFTSetupButton(void) {
     if (gBtnWindow) return;
     gBtnWindow = [[UIWindow alloc] initWithFrame:CGRectMake(30, 280, 56, 56)];
@@ -579,22 +908,22 @@ static void CFTSetupButton(void) {
     gBtnWindow.backgroundColor = UIColor.clearColor;
 
     gBtn = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 56, 56)];
-    gBtn.backgroundColor = [UIColor colorWithRed:0.12 green:0.12 blue:0.12 alpha:0.9];
+    gBtn.backgroundColor = CFTHex(0x121417, 0.95);
     gBtn.layer.cornerRadius = 28;
     gBtn.layer.borderWidth = 1;
-    gBtn.layer.borderColor = [UIColor colorWithRed:1.0 green:0.45 blue:0.05 alpha:1].CGColor;
+    gBtn.layer.borderColor = kCFTAccent.CGColor;
 
     UILabel *lab = [[UILabel alloc] initWithFrame:gBtn.bounds];
     lab.text = @"CF";
-    lab.textColor = [UIColor colorWithRed:1.0 green:0.45 blue:0.05 alpha:1];
+    lab.textColor = kCFTAccent;
     lab.font = [UIFont systemFontOfSize:18 weight:UIFontWeightBold];
     lab.textAlignment = NSTextAlignmentCenter;
     [gBtn addSubview:lab];
 
-    gController = [CFTController new];
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:gController
+    CFTController *ctl = [CFTController new];
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:ctl
                                                                           action:@selector(onTap)];
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:gController
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:ctl
                                                                           action:@selector(onPan:)];
     [gBtn addGestureRecognizer:tap];
     [gBtn addGestureRecognizer:pan];
@@ -614,8 +943,8 @@ __attribute__((constructor)) static void CFT_ctor(void) {
         dispatch_async(dispatch_get_main_queue(), ^{
             CFTSetupButton();
         });
-        // 后台预解析，不弹窗、不阻塞
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            CFTAttach();
             CFTInit();
         });
     }
