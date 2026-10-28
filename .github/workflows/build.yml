@@ -41,7 +41,8 @@ jobs:
 
       - name: 导出成品
         run: |
-          cp .theos/obj/debug/libCounterFlameTool.dylib CounterFlameTool.dylib
+          find .theos/obj/debug -name '*.dylib' -maxdepth 2
+          cp .theos/obj/debug/CounterFlameTool.dylib CounterFlameTool.dylib
 
       - name: 校验架构与依赖
         run: |
