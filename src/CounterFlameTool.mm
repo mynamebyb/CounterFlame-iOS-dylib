@@ -1043,6 +1043,7 @@ static UIView *gBtnHostView;
 @implementation CFTController
 
 - (void)onTap {
+    CFTLog(@"onTap fired (触摸确实到球)");
     if (gMenuWindow && !gMenuWindow.hidden) {
         gMenuWindow.hidden = YES;
     } else {
@@ -1051,6 +1052,7 @@ static UIView *gBtnHostView;
 }
 
 - (void)onPan:(UIPanGestureRecognizer*)gr {
+    CFTLog(@"onPan state=%ld pos=%@", (long)gr.state, NSStringFromCGPoint([gr locationInView:gBtnHostView]));
     if (!gBtn || !gBtnHostView) return;
     CGRect f = gBtn.frame;
     f.origin.x += [gr translationInView:gBtnHostView].x;
@@ -1134,14 +1136,41 @@ static void CFTSetupButton(void) {
 
     [host addSubview:gBtn];
     [host bringSubviewToFront:gBtn];
+
+    // 诊断：记录球的 superview 是否可交互、frame 是否越界，方便判断触摸是否被拦截
+    CFTLog(@"悬浮球已挂载 host=%@ frame=%@ hostSize=%@ host.userInteract=%d btn.userInteract=%d",
+           [host class],
+           NSStringFromCGRect(gBtn.frame),
+           NSStringFromCGSize(host.bounds.size),
+           host.userInteractionEnabled,
+           gBtn.userInteractionEnabled);
+
+    // 命中诊断：1.5s 后打印一次球中心点最终命中的 view，用于判断是否被 UnityView 或状态栏等抢占
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!gBtn || !gBtn.superview) return;
+        UIView *hit = [gBtn.superview hitTest:gBtn.center withEvent:nil];
+        CFTLog(@"悬浮球 hitTest(center=%@) => %@ (same=%@)",
+               NSStringFromCGPoint(gBtn.center), [hit class],
+               @(hit == gBtn));
+        CFTLog(@"悬浮球 superviewSubviews=%lu centerInView=%@",
+               (unsigned long)gBtn.superview.subviews.count,
+               @(CGRectContainsRect(gBtn.superview.bounds, gBtn.frame)));
+    });
+
     // 低频置顶：防止 Unity 后续 addSubview 把球盖到下层导致不可点。
     if (!gBtnTopTimer) {
         gBtnTopTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t){
-            if (gBtn && gBtn.superview) [gBtn.superview bringSubviewToFront:gBtn];
+            if (gBtn && gBtn.superview) {
+                [gBtn.superview bringSubviewToFront:gBtn];
+                // 同时保证球在可视区（host 旋转/尺寸变化后可能出界）
+                CGRect hb = gBtn.superview.bounds;
+                if (!CGRectContainsPoint(hb, gBtn.center)) {
+                    gBtn.center = CGPointMake(hb.size.width / 2, hb.size.height / 2);
+                }
+            }
         }];
     }
-    CFTLog(@"悬浮球已挂载到 host=%@ frame=%@ hostSize=%@", [host class],
-           NSStringFromCGRect(gBtn.frame), NSStringFromCGSize(host.bounds.size));
 }
 
 #pragma mark - 加载入口
