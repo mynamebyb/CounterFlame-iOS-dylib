@@ -146,7 +146,7 @@ static BOOL gShowRay = NO;
 @implementation CFTTarget @end
 
 static NSArray<CFTTarget*>* CFTTargets(void) {
-    static NSArray *a;
+    static NSArray<CFTTarget*> *a;
     static dispatch_once_t t;
     dispatch_once(&t, ^{
         NSArray *raw = @[
@@ -782,10 +782,11 @@ static UIButton* CFTMakeRectButton(CGRect frame, NSString *title) {
 }
 
 static void CFTUpdateClassButtonStyles(void) {
-    NSArray *targets = CFTTargets();
+    NSArray<CFTTarget*> *targets = CFTTargets();
     for (NSUInteger i = 0; i < gClassButtons.count; i++) {
         UIButton *b = gClassButtons[i];
-        BOOL sel = [targets[i].fullName isEqualToString:gCurrentClassName];
+        CFTTarget *t = (CFTTarget*)targets[i];
+        BOOL sel = [t.fullName isEqualToString:gCurrentClassName];
         b.layer.borderColor = (sel ? kCFTAccent : kCFTLine).CGColor;
         [b setTitleColor:(sel ? kCFTAccent : kCFTText) forState:UIControlStateNormal];
         b.backgroundColor = sel ? CFTHex(0xFF720F, 0.14) : kCFTBtn;
@@ -1045,8 +1046,8 @@ static void CFTSetupButton(void) {
                                                                           action:@selector(onTap)];
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:ctl
                                                                           action:@selector(onPan:)];
-    [gBtn addSubview:tap];
-    [gBtn addSubview:pan];
+    [gBtn addGestureRecognizer:tap];
+    [gBtn addGestureRecognizer:pan];
 
     UIViewController *vc = [UIViewController new];
     vc.view = gBtn;
