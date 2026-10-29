@@ -1067,8 +1067,13 @@ static UIView *gBtn;
 
 static void CFTSetupButton(void) {
     if (gBtnWindow) return;
-    gBtnWindow = CFTMakeTouchWindow(CGRectMake(30, 280, 56, 56), UIWindowLevelStatusBar + 400);
+    // 悬浮球用普通 UIWindow 构造，不套 CFTTouchWindow（scene 绑定可能导致 view 不显示）
+    gBtnWindow = [[UIWindow alloc] initWithFrame:CGRectMake(30, 280, 56, 56)];
+    gBtnWindow.windowLevel = UIWindowLevelStatusBar + 400;
+    gBtnWindow.backgroundColor = UIColor.clearColor;
+    gBtnWindow.userInteractionEnabled = YES;
     gBtnWindow.exclusiveTouch = YES;
+    gBtnWindow.hidden = NO;
 
     // gBtn 圆形视图，透明区域不响应（pointInside 由 CFTTouchWindow 兜底整块命中）
     gBtn = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 56, 56)];
