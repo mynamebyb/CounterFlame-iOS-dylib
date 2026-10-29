@@ -181,7 +181,12 @@ static Il2CppObject* CFTInvoke(const MethodInfo *m, void *obj, void **params) {
     if (!m || !fn_runtime_invoke) return NULL;
     Il2CppException *exc = NULL;
     Il2CppObject *r = fn_runtime_invoke(m, obj, params, &exc);
-    if (exc) CFTLog(@"invoke 异常 method=%p", m);
+    if (exc) {
+        // 尽量把异常类名带出来，方便日志定位是哪类调用失败
+        Il2CppClass *ec = fn_object_get_class ? fn_object_get_class((Il2CppObject*)exc) : NULL;
+        const char *ename = (ec && fn_class_get_name) ? fn_class_get_name(ec) : "Unknown";
+        CFTLog(@"invoke 异常 method=%p 类名=%s", m, ename ? ename : "Unknown");
+    }
     return r;
 }
 
@@ -956,15 +961,19 @@ static void CFTMenuBuild(void) {
     };
     gSwBox.changed = ^(BOOL on) {
         gShowBox = on; [gOverlayView setNeedsDisplay];
+        CFTLog(@"开关 方框 → %@", on ? @"开" : @"关");
     };
     gSwName.changed = ^(BOOL on) {
         gShowName = on; [gOverlayView setNeedsDisplay];
+        CFTLog(@"开关 名字 → %@", on ? @"开" : @"关");
     };
     gSwDist.changed = ^(BOOL on) {
         gShowDistance = on; [gOverlayView setNeedsDisplay];
+        CFTLog(@"开关 距离 → %@", on ? @"开" : @"关");
     };
     gSwRay.changed = ^(BOOL on) {
         gShowRay = on; [gOverlayView setNeedsDisplay];
+        CFTLog(@"开关 射线 → %@", on ? @"开" : @"关");
     };
 
     CFTUpdateSubSwitches();
@@ -985,9 +994,10 @@ static void CFTMenuBuild(void) {
 @end
 @implementation UIButton (CFTHandlers)
 - (void)cft_classTapped:(UIButton*)sender {
-    NSArray *targets = CFTTargets();
+    NSArray<CFTTarget*> *targets = CFTTargets();
     if ((NSUInteger)sender.tag >= targets.count) return;
-    CFTTarget *tt = targets[sender.tag];
+    CFTTarget *tt = (CFTTarget*)targets[sender.tag];
+    CFTLog(@"点击类名按钮：%@（%@）", tt.comment, tt.fullName);
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         CFTAttach();
         CFTSelectTarget(tt);
@@ -997,6 +1007,7 @@ static void CFTMenuBuild(void) {
     });
 }
 - (void)cft_cameraTapped {
+    CFTLog(@"点击按钮：重新获取摄像机");
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         CFTAttach();
         CFTInit();
