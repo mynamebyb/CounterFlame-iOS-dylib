@@ -455,25 +455,22 @@ static UIWindowScene* CFTActiveWindowScene(void) {
     return fallback;
 }
 
-// 触摸接收窗口：整个窗口矩形都是命中区，命中后交给内部视图；
-// 内部没有子视图命中时回落到 panel 本身，绝不让事件漏给下层窗口（游戏）。
+// 触摸接收窗口：整块矩形都是命中区，点空白不穿透到下层游戏窗口。
 @interface CFTTouchWindow : UIWindow
 @end
 
 @implementation CFTTouchWindow
 
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    return CGRectContainsPoint(self.bounds, point);
+    return YES;   // 整块窗口区域都算命中
 }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    if (!self.isUserInteractionEnabled || self.isHidden || self.alpha <= 0.01) return nil;
+    if (!self.isUserInteractionEnabled || self.isHidden) return nil;
     UIView *hit = [super hitTest:point withEvent:event];
     if (hit) return hit;
-    if (CGRectContainsPoint(self.bounds, point)) {
-        return self.rootViewController.view ?: self;
-    }
-    return nil;
+    // 空白区域回落到 rootViewController.view（面板自身），不让事件漏给游戏
+    return self.rootViewController.view;
 }
 
 @end
@@ -490,6 +487,8 @@ static UIWindowScene* CFTActiveWindowScene(void) {
 
 @end
 
+// 构造触摸窗口：尝试绑定活跃 scene，失败则回退 initWithFrame。
+// window 初始 hidden=NO，确保注册进 UIApplication.windows 事件链。
 static UIWindow* CFTMakeTouchWindow(CGRect frame, UIWindowLevel level) {
     UIWindow *w = nil;
     UIWindowScene *ws = CFTActiveWindowScene();
@@ -499,9 +498,9 @@ static UIWindow* CFTMakeTouchWindow(CGRect frame, UIWindowLevel level) {
     w.windowLevel = level;
     w.backgroundColor = UIColor.clearColor;
     w.userInteractionEnabled = YES;
-    w.hidden = YES;   // 由调用方在挂好 rootViewController 之后再显示
+    w.hidden = NO;   // 立即可见，注册进事件链
     CFTLog(@"建立触摸窗口 frame=%@ level=%.0f scene=%@",
-           NSStringFromCGRect(frame), (double)level, ws ? @"已绑定" : @"无(scene 回退)");
+           NSStringFromCGRect(frame), (double)level, ws ? @"已绑定" : @"无(回退)");
     return w;
 }
 
@@ -830,6 +829,7 @@ static void CFTMenuBuild(void) {
     // 面板窗口层级高于悬浮球窗口，避免面板被小球窗口压住
     gMenuWindow = CFTMakeTouchWindow(defaultFrame, UIWindowLevelStatusBar + 450);
     gMenuWindow.exclusiveTouch = YES;
+    gMenuWindow.hidden = YES;   // 面板先建好，由 CFTMenuShow 再显示
 
     gPanel = [[CFTPanelView alloc] initWithFrame:CGRectMake(0, 0, W, H)];
     gPanel.backgroundColor = kCFTBg;
@@ -982,7 +982,6 @@ static void CFTMenuBuild(void) {
     UIViewController *vc = [UIViewController new];
     vc.view = gPanel;
     gMenuWindow.rootViewController = vc;
-    gMenuWindow.hidden = YES;   // 挂好根控制器后再由 CFTMenuShow 显示
     CFTLog(@"菜单面板构建完成 size=%@ 面板可交互=%@",
            NSStringFromCGSize(gPanel.frame.size), gPanel.isUserInteractionEnabled ? @"是" : @"否");
 }
@@ -1071,6 +1070,7 @@ static void CFTSetupButton(void) {
     gBtnWindow = CFTMakeTouchWindow(CGRectMake(30, 280, 56, 56), UIWindowLevelStatusBar + 400);
     gBtnWindow.exclusiveTouch = YES;
 
+    // gBtn 圆形视图，透明区域不响应（pointInside 由 CFTTouchWindow 兜底整块命中）
     gBtn = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 56, 56)];
     gBtn.backgroundColor = CFTHex(0x121417, 0.95);
     gBtn.layer.cornerRadius = 28;
