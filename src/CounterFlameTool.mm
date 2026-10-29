@@ -597,7 +597,11 @@ static void CFTRefreshScan(void) {
 
     Il2CppClass *cls = CFTFindGameClass(tt);   // 每轮重新获取类
     if (!cls) {
-        CFTLog(@"未找到类 %@", tt.fullName);
+        CFTLog(@"未找到类 %@，清空旧结果防止野指针", tt.fullName);
+        // 类暂时找不到时，清空旧 items，避免用上一轮可能已失效的指针继续画
+        dispatch_async(dispatch_get_main_queue(), ^{
+            gOverlayView.items = @[];
+        });
         return;
     }
     NSArray<CFTItem*> *items = CFTBuildItems(cls, tt);
@@ -608,10 +612,19 @@ static void CFTRefreshScan(void) {
     });
 }
 
+static void CFTStopScanTimer(void) {
+    if (gScanTimer) {
+        [gScanTimer invalidate];
+        gScanTimer = nil;
+        CFTLog(@"扫描定时器已停止");
+    }
+}
+
 static void CFTSelectTarget(CFTTarget *tt) {
     CFTAttach();
     CFTInit();
     CFTGetCamera();                              // 点类名同时自动重新获取摄像机
+    CFTStopScanTimer();                          // 切目标前先停旧定时器，避免旧类名轮询
     gCurrentClassName = tt.fullName;
     gCurrentComment = tt.comment;
 
@@ -619,15 +632,13 @@ static void CFTSelectTarget(CFTTarget *tt) {
     CFTLog(@"选择类 %@（%@）类=%@ 摄像机=%p",
            tt.fullName, tt.comment, cls ? @"已获取" : @"未找到", gMainCamera);
 
-    if (!gScanTimer) {
-        gScanTimer = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES
-                                                        block:^(NSTimer *t) {
-            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                CFTAttach();                     // GCD 线程每次必须 attach
-                CFTRefreshScan();
-            });
-        }];
-    }
+    gScanTimer = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES
+                                                 block:^(NSTimer *t) {
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            CFTAttach();                         // GCD 线程每次必须 attach
+            CFTRefreshScan();
+        });
+    }];
     CFTRefreshScan();
 }
 
@@ -752,6 +763,10 @@ static CFTSwitch *gSwRay;
 
 - (void)onMinimize {
     gMenuWindow.hidden = YES;
+    CFTStopScanTimer();                         // 最小化时暂停扫描
+    if (gOverlayView) gOverlayView.items = @[];
+    if (gOverlayWindow) gOverlayWindow.hidden = YES;
+    CFTLog(@"菜单最小化，扫描已暂停");
 }
 
 @end
@@ -913,14 +928,31 @@ static void CFTMenuBuild(void) {
 
     gSwDraw.changed = ^(BOOL on) {
         gDrawEnabled = on;
-        CFTSetupOverlay();
-        gOverlayWindow.hidden = !on;
-        if (!on) {
-            gOverlayView.items = @[];
-        } else {
+        if (on) {
+            CFTSetupOverlay();
+            gOverlayWindow.hidden = NO;
             [gOverlayView setNeedsDisplay];
+            if (!gCurrentClassName) {
+                CFTLog(@"绘制开启但未选类，等待选择类后启动扫描");
+            } else {
+                CFTRefreshScan();
+                if (!gScanTimer) {
+                    gScanTimer = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES
+                                                                 block:^(NSTimer *t) {
+                        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                            CFTAttach();
+                            CFTRefreshScan();
+                        });
+                    }];
+                }
+            }
+        } else {
+            CFTStopScanTimer();                  // 关绘制时停扫描，释放资源
+            gOverlayView.items = @[];
+            gOverlayWindow.hidden = YES;
         }
         CFTUpdateSubSwitches();
+        CFTLog(@"绘制总开关 → %@", on ? @"开" : @"关");
     };
     gSwBox.changed = ^(BOOL on) {
         gShowBox = on; [gOverlayView setNeedsDisplay];
