@@ -3,6 +3,8 @@
 //
 //  v2：安卓 libtool 风格实色面板（无液态玻璃）；修复触控穿透、选类闪退；
 //  选类自动获取类/对象/摄像机；绘制总开关默认关。
+//  v3：悬浮窗触摸修复——整块面板作为触摸接收区，空白区域拦截触摸不穿透到游戏；
+//  面板任意区域可拖动，不再局限于小圆点/标题栏。
 //  arm64 / arm64e 通用 fat dylib。
 //
 
@@ -613,6 +615,24 @@ static void CFTSelectTarget(CFTTarget *tt) {
 
 @end
 
+#pragma mark - 触摸接收面板（整块拦截，防止穿透到游戏）
+
+@interface CFTPanelView : UIView
+@end
+
+@implementation CFTPanelView
+
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    return YES;   // 整个面板区域（含空白）都算命中
+}
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    return hit ?: self;   // 子控件优先；空白区域由面板自己拦截，不让触摸穿透
+}
+
+@end
+
 #pragma mark - 菜单面板（独立窗口，整块可触控）
 
 static UIWindow *gMenuWindow;
@@ -703,15 +723,18 @@ static void CFTMenuBuild(void) {
     gMenuWindow = [[UIWindow alloc] initWithFrame:defaultFrame];
     gMenuWindow.windowLevel = UIWindowLevelStatusBar + 400;
     gMenuWindow.backgroundColor = UIColor.clearColor;
+    gMenuWindow.userInteractionEnabled = YES;   // 窗口接管触摸
+    gMenuWindow.exclusiveTouch = YES;
+    gMenuWindow.hidden = NO;                    // 注册为可见窗口，确保接收触摸
 
-    gPanel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, W, H)];
+    gPanel = [[CFTPanelView alloc] initWithFrame:CGRectMake(0, 0, W, H)];
     gPanel.backgroundColor = kCFTBg;
     gPanel.layer.cornerRadius = 6;
     gPanel.layer.borderWidth = 1;
     gPanel.layer.borderColor = kCFTLine.CGColor;
     gPanel.clipsToBounds = YES;
 
-    // 标题栏（可拖动）
+    // 标题栏（含最小化按钮）
     UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, W, 36)];
     bar.backgroundColor = kCFTBar;
     UILabel *title = CFTMakeLabel(CGRectMake(12, 0, 200, 36),
@@ -729,10 +752,14 @@ static void CFTMenuBuild(void) {
                  forControlEvents:UIControlEventTouchUpInside];
     [bar addSubview:min];
 
+    [gPanel addSubview:bar];
+
+    // 整块面板可拖动（标题栏不再单独挂手势，避免拖动量叠加）
     UIPanGestureRecognizer *mp = [[UIPanGestureRecognizer alloc]
         initWithTarget:gMenuController action:@selector(onMenuPan:)];
-    [bar addGestureRecognizer:mp];
-    [gPanel addSubview:bar];
+    mp.cancelsTouchesInView = NO;   // 不取消按钮/开关的点击
+    mp.delaysTouchesBegan = NO;
+    [gPanel addGestureRecognizer:mp];
 
     // 分组：目标类
     [gPanel addSubview:CFTMakeLabel(CGRectMake(12, 44, 200, 12),
@@ -910,6 +937,8 @@ static void CFTSetupButton(void) {
     gBtnWindow = [[UIWindow alloc] initWithFrame:CGRectMake(30, 280, 56, 56)];
     gBtnWindow.windowLevel = UIWindowLevelStatusBar + 400;
     gBtnWindow.backgroundColor = UIColor.clearColor;
+    gBtnWindow.userInteractionEnabled = YES;   // 确保小圆点窗口接管触摸
+    gBtnWindow.exclusiveTouch = YES;
 
     gBtn = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 56, 56)];
     gBtn.backgroundColor = CFTHex(0x121417, 0.95);
