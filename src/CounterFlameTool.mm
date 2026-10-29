@@ -155,7 +155,7 @@ static NSArray<CFTTarget*>* CFTTargets(void) {
             @[@"UnityEngine.BoxCollider", @"物品 1"],
             @[@"UnityEngine.Rigidbody", @"物品 2"]
         ];
-        NSMutableArray *m = [NSMutableArray array];
+        NSMutableArray<CFTTarget*> *m = [NSMutableArray array];
         for (NSArray *r in raw) {
             NSString *full = r[0];
             NSRange dot = [full rangeOfString:@"." options:NSBackwardsSearch];
