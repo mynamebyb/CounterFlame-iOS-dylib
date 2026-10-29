@@ -1033,13 +1033,14 @@ static void CFTMenuShow(void) {
 
 #pragma mark - 悬浮按钮
 
+static UIWindow *gBtnWindow;
 static UIView *gBtn;
-static UIView *gBtnHostView;
 
 @interface CFTController : NSObject
 - (void)onTap;
 - (void)onPan:(UIPanGestureRecognizer*)gr;
 @end
+static CFTController *gBtnCtl;   // 保留引用避免被释放（tap/pan target）
 @implementation CFTController
 
 - (void)onTap {
@@ -1052,66 +1053,33 @@ static UIView *gBtnHostView;
 }
 
 - (void)onPan:(UIPanGestureRecognizer*)gr {
-    CFTLog(@"onPan state=%ld pos=%@", (long)gr.state, NSStringFromCGPoint([gr locationInView:gBtnHostView]));
-    if (!gBtn || !gBtnHostView) return;
-    CGRect f = gBtn.frame;
-    f.origin.x += [gr translationInView:gBtnHostView].x;
-    f.origin.y += [gr translationInView:gBtnHostView].y;
-    CGRect sb = gBtnHostView.bounds;
-    f.origin.x = MAX(0, MIN(f.origin.x, sb.size.width - f.size.width));
-    f.origin.y = MAX(0, MIN(f.origin.y, sb.size.height - f.size.height));
-    gBtn.frame = f;
-    [gr setTranslation:CGPointZero inView:gBtnHostView];
+    CFTLog(@"onPan state=%ld pos=%@", (long)gr.state, NSStringFromCGPoint([gr locationInView:gBtnWindow]));
+    if (!gBtnWindow) return;
+    CGFloat tx = [gr translationInView:gBtnWindow].x;
+    CGFloat ty = [gr translationInView:gBtnWindow].y;
+    CGRect wf = gBtnWindow.frame;
+    wf.origin.x += tx;
+    wf.origin.y += ty;
+    CGRect sb = gBtnWindow.screen.bounds;
+    wf.origin.x = MAX(0, MIN(wf.origin.x, sb.size.width  - wf.size.width));
+    wf.origin.y = MAX(0, MIN(wf.origin.y, sb.size.height - wf.size.height));
+    gBtnWindow.frame = wf;
+    [gr setTranslation:CGPointZero inView:gBtnWindow];
 }
 @end
 
-// 悬浮球挂到游戏主 window 本身（不是 rootViewController.view）。
-// Unity 的 RootViewController.view 常常 userInteractionEnabled=NO（触摸全交给渲染视图），
-// 挂在它上面的球会“可见但收不到任何事件”。window 默认可交互，作为其最顶层 subview 才能稳定命中 tap/pan。
-static UIView* CFTVisibleHostView(void) {
-    NSArray<UIWindow *> *wins = UIApplication.sharedApplication.windows;
-    UIWindow *key = UIApplication.sharedApplication.keyWindow;
-    if (key && !key.hidden && key.rootViewController &&
-        key != gMenuWindow && key != gOverlayWindow) {
-        return key;
-    }
-    for (UIWindow *w in wins) {
-        if (w.hidden) continue;
-        if (w == gMenuWindow || w == gOverlayWindow) continue;
-        if (!w.rootViewController) continue;   // 跳过 status bar 等系统窗口
-        return w;
-    }
-    return nil;
-}
-
-static NSTimer *gBtnTopTimer;
-
+// 悬浮球用独立 CFTTouchWindow（复用已有类），脱离游戏 window 的 subview 树，
+// 事件链独立，Unity 抢不走触摸。球视图占满整个窗口，点/拖均落在球上。
 static void CFTSetupButton(void) {
-    UIView *host = CFTVisibleHostView();
-    if (!host) {
-        CFTLog(@"悬浮球：未找到可见 host view，500ms 后重试");
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            CFTSetupButton();
-        });
-        return;
-    }
+    if (gBtnWindow) return;
 
-    if (gBtn && gBtn.superview == host) {
-        [host bringSubviewToFront:gBtn];
-        return;
-    }
-    if (gBtn) {
-        [gBtn removeFromSuperview];
-        gBtn = nil;
-        gBtnHostView = nil;
-    }
+    CGSize sb = UIScreen.mainScreen.bounds.size;
+    CGRect winFrame = CGRectMake(30, MAX(120, sb.height * 0.35), 56, 56);
 
-    gBtnHostView = host;
-    CGSize sz = host.bounds.size;
-    CGRect btnFrame = CGRectMake(30, MAX(120, sz.height * 0.35), 56, 56);
+    gBtnWindow = CFTMakeTouchWindow(winFrame, UIWindowLevelStatusBar + 500);
 
-    gBtn = [[UIView alloc] initWithFrame:btnFrame];
+    gBtn = [[UIView alloc] initWithFrame:gBtnWindow.bounds];
+    gBtn.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     gBtn.backgroundColor = CFTHex(0x121417, 0.95);
     gBtn.layer.cornerRadius = 28;
     gBtn.layer.borderWidth = 1;
@@ -1125,52 +1093,25 @@ static void CFTSetupButton(void) {
     lab.textAlignment = NSTextAlignmentCenter;
     [gBtn addSubview:lab];
 
-    CFTController *ctl = [CFTController new];
-
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:ctl
+    gBtnCtl = [CFTController new];
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:gBtnCtl
                                                                           action:@selector(onTap)];
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:ctl
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:gBtnCtl
                                                                           action:@selector(onPan:)];
     [gBtn addGestureRecognizer:tap];
     [gBtn addGestureRecognizer:pan];
 
-    [host addSubview:gBtn];
-    [host bringSubviewToFront:gBtn];
+    UIViewController *vc = [UIViewController new];
+    vc.view = gBtn;
+    gBtnWindow.rootViewController = vc;
+    gBtnWindow.hidden = NO;
 
-    // 诊断：记录球的 superview 是否可交互、frame 是否越界，方便判断触摸是否被拦截
-    CFTLog(@"悬浮球已挂载 host=%@ frame=%@ hostSize=%@ host.userInteract=%d btn.userInteract=%d",
-           [host class],
-           NSStringFromCGRect(gBtn.frame),
-           NSStringFromCGSize(host.bounds.size),
-           host.userInteractionEnabled,
-           gBtn.userInteractionEnabled);
+    // rootVC 装载后 vc.view.frame 可能被重置，手动对齐一次确保球可见
+    gBtn.frame = gBtnWindow.bounds;
 
-    // 命中诊断：1.5s 后打印一次球中心点最终命中的 view，用于判断是否被 UnityView 或状态栏等抢占
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (!gBtn || !gBtn.superview) return;
-        UIView *hit = [gBtn.superview hitTest:gBtn.center withEvent:nil];
-        CFTLog(@"悬浮球 hitTest(center=%@) => %@ (same=%@)",
-               NSStringFromCGPoint(gBtn.center), [hit class],
-               @(hit == gBtn));
-        CFTLog(@"悬浮球 superviewSubviews=%lu centerInView=%@",
-               (unsigned long)gBtn.superview.subviews.count,
-               @(CGRectContainsRect(gBtn.superview.bounds, gBtn.frame)));
-    });
-
-    // 低频置顶：防止 Unity 后续 addSubview 把球盖到下层导致不可点。
-    if (!gBtnTopTimer) {
-        gBtnTopTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t){
-            if (gBtn && gBtn.superview) {
-                [gBtn.superview bringSubviewToFront:gBtn];
-                // 同时保证球在可视区（host 旋转/尺寸变化后可能出界）
-                CGRect hb = gBtn.superview.bounds;
-                if (!CGRectContainsPoint(hb, gBtn.center)) {
-                    gBtn.center = CGPointMake(hb.size.width / 2, hb.size.height / 2);
-                }
-            }
-        }];
-    }
+    CFTLog(@"悬浮球独立窗口已建立 frame=%@ level=%.0f vcViewFrame=%@",
+           NSStringFromCGRect(gBtnWindow.frame), (double)gBtnWindow.windowLevel,
+           NSStringFromCGRect(gBtn.frame));
 }
 
 #pragma mark - 加载入口
