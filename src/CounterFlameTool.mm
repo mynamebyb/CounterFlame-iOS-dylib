@@ -1073,10 +1073,29 @@ static CFTController *gBtnCtl;   // 保留引用避免被释放（tap/pan target
 static void CFTSetupButton(void) {
     if (gBtnWindow) return;
 
+    // 球窗口必须走 scene 构造（iOS 13+ Scene 架构下 initWithFrame: 不渲染到屏）。
+    // 拿不到活跃 scene 时（constructor 跑得太早，scene 还没激活）就 200ms 后重试，
+    // 绝不回退到 initWithFrame:，否则窗口静默失败。
+    UIWindowScene *ws = CFTActiveWindowScene();
+    if (!ws) {
+        CFTLog(@"悬浮球：未取到活跃 UIWindowScene，200ms 后重试（不建 window）");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            CFTSetupButton();
+        });
+        return;
+    }
+
     CGSize sb = UIScreen.mainScreen.bounds.size;
     CGRect winFrame = CGRectMake(30, MAX(120, sb.height * 0.35), 56, 56);
 
-    gBtnWindow = CFTMakeTouchWindow(winFrame, UIWindowLevelStatusBar + 500);
+    gBtnWindow = [[CFTTouchWindow alloc] initWithWindowScene:ws];
+    gBtnWindow.frame = winFrame;
+    gBtnWindow.windowLevel = UIWindowLevelAlert + 100;
+    gBtnWindow.backgroundColor = UIColor.clearColor;
+    gBtnWindow.userInteractionEnabled = YES;
+    gBtnWindow.hidden = NO;
+    CFTLog(@"悬浮球：window 已建（scene=%@）frame=%@ level=%.0f", NSStringFromSelector(@selector(alloc)), NSStringFromCGRect(gBtnWindow.frame), (double)gBtnWindow.windowLevel);
 
     gBtn = [[UIView alloc] initWithFrame:gBtnWindow.bounds];
     gBtn.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
