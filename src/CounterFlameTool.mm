@@ -1123,7 +1123,6 @@ static void CFTSetupButton(void) {
     [gBtn addSubview:lab];
 
     CFTController *ctl = [CFTController new];
-    objc_setAssociatedObject(gBtn, @"CFTController", ctl, OBJC_ASSOCIATION_RETAIN);
 
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:ctl
                                                                           action:@selector(onTap)];
