@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - name: 检出
         uses: actions/checkout@v4
@@ -36,7 +36,7 @@ jobs:
         run: |
           export THEOS="$HOME/theos"
           make clean
-          make
+          make -j8
           ls -la .theos/obj/debug/
 
       - name: 导出成品
