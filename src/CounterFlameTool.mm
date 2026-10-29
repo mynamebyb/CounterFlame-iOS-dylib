@@ -1033,8 +1033,8 @@ static void CFTMenuShow(void) {
 
 #pragma mark - 悬浮按钮
 
-static UIWindow *gBtnWindow;
 static UIView *gBtn;
+static UIView *gBtnHostView;
 
 @interface CFTController : NSObject
 - (void)onTap;
@@ -1051,38 +1051,71 @@ static UIView *gBtn;
 }
 
 - (void)onPan:(UIPanGestureRecognizer*)gr {
-    UIWindow *win = gBtnWindow;
-    if (!win) return;
-    const CGFloat half = 28;
-    CGPoint t = [gr translationInView:win];
-    CGPoint c = win.center;
-    c.x += t.x; c.y += t.y;
-    CGRect sb = win.screen.bounds;
-    c.x = MAX(half, MIN(sb.size.width - half, c.x));
-    c.y = MAX(half, MIN(sb.size.height - half, c.y));
-    win.center = c;
-    [gr setTranslation:CGPointZero inView:win];
+    if (!gBtn || !gBtnHostView) return;
+    CGRect f = gBtn.frame;
+    f.origin.x += [gr translationInView:gBtnHostView].x;
+    f.origin.y += [gr translationInView:gBtnHostView].y;
+    CGRect sb = gBtnHostView.bounds;
+    f.origin.x = MAX(0, MIN(f.origin.x, sb.size.width - f.size.width));
+    f.origin.y = MAX(0, MIN(f.origin.y, sb.size.height - f.size.height));
+    gBtn.frame = f;
+    [gr setTranslation:CGPointZero inView:gBtnHostView];
 }
 @end
 
-static void CFTSetupButton(void) {
-    if (gBtnWindow) return;
-    // 悬浮球用普通 UIWindow 构造，不套 CFTTouchWindow（scene 绑定可能导致 view 不显示）
-    gBtnWindow = [[UIWindow alloc] initWithFrame:CGRectMake(30, 280, 56, 56)];
-    gBtnWindow.windowLevel = UIWindowLevelStatusBar + 400;
-    gBtnWindow.backgroundColor = UIColor.clearColor;
-    gBtnWindow.userInteractionEnabled = YES;
-    gBtnWindow.exclusiveTouch = YES;
-    gBtnWindow.hidden = NO;
+// 悬浮球不新建 UIWindow：某些 Scene/Unity 主窗口生命周期下独立小窗口可能不会上屏。
+// 直接把小球挂到当前可见主窗口 root view，确保可见，同时保留 tap/pan。
+static UIView* CFTVisibleHostView(void) {
+    UIWindow *key = UIApplication.sharedApplication.keyWindow;
+    if (key && !key.hidden && key.rootViewController && key.rootViewController.view) {
+        return key.rootViewController.view;
+    }
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        if (w.hidden) continue;
+        if (w.rootViewController && w.rootViewController.view) {
+            return w.rootViewController.view;
+        }
+    }
+    if (key) return key;
+    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+        if (!w.hidden) return w;
+    }
+    return nil;
+}
 
-    // gBtn 圆形视图，透明区域不响应（pointInside 由 CFTTouchWindow 兜底整块命中）
-    gBtn = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 56, 56)];
+static void CFTSetupButton(void) {
+    UIView *host = CFTVisibleHostView();
+    if (!host) {
+        CFTLog(@"悬浮球：未找到可见 host view，500ms 后重试");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            CFTSetupButton();
+        });
+        return;
+    }
+
+    if (gBtn && gBtn.superview == host) {
+        [host bringSubviewToFront:gBtn];
+        return;
+    }
+    if (gBtn) {
+        [gBtn removeFromSuperview];
+        gBtn = nil;
+        gBtnHostView = nil;
+    }
+
+    gBtnHostView = host;
+    CGSize sz = host.bounds.size;
+    CGRect btnFrame = CGRectMake(30, MAX(120, sz.height * 0.35), 56, 56);
+
+    gBtn = [[UIView alloc] initWithFrame:btnFrame];
     gBtn.backgroundColor = CFTHex(0x121417, 0.95);
     gBtn.layer.cornerRadius = 28;
     gBtn.layer.borderWidth = 1;
     gBtn.layer.borderColor = kCFTAccent.CGColor;
 
     UILabel *lab = [[UILabel alloc] initWithFrame:gBtn.bounds];
+    lab.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     lab.text = @"CF";
     lab.textColor = kCFTAccent;
     lab.font = [UIFont systemFontOfSize:18 weight:UIFontWeightBold];
@@ -1090,6 +1123,8 @@ static void CFTSetupButton(void) {
     [gBtn addSubview:lab];
 
     CFTController *ctl = [CFTController new];
+    objc_setAssociatedObject(gBtn, @"CFTController", ctl, OBJC_ASSOCIATION_RETAIN);
+
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:ctl
                                                                           action:@selector(onTap)];
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:ctl
@@ -1097,10 +1132,10 @@ static void CFTSetupButton(void) {
     [gBtn addGestureRecognizer:tap];
     [gBtn addGestureRecognizer:pan];
 
-    UIViewController *vc = [UIViewController new];
-    vc.view = gBtn;
-    gBtnWindow.rootViewController = vc;
-    gBtnWindow.hidden = NO;
+    [host addSubview:gBtn];
+    [host bringSubviewToFront:gBtn];
+    CFTLog(@"悬浮球已挂载到 host=%@ frame=%@ hostSize=%@", [host class],
+           NSStringFromCGRect(gBtn.frame), NSStringFromCGSize(host.bounds.size));
 }
 
 #pragma mark - 加载入口
