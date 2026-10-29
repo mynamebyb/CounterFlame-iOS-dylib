@@ -619,6 +619,11 @@ static void CFTSetupOverlay(void) {
     gOverlayWindow.hidden = !gDrawEnabled;
 }
 
+@class CFTSwitch;
+
+static CFTSwitch *gSwDraw;
+static void CFTUpdateSubSwitches(void);
+
 #pragma mark - 扫描定时
 
 static NSTimer *gScanTimer;
@@ -730,16 +735,14 @@ static void CFTSelectTarget(CFTTarget *tt) {
     // 先停旧定时器并复位绘制状态，再切换类名，避免旧类名定时器在窗口期继续运行。
     CFTCleanupDrawState();
     os_unfair_lock_lock(&gScanLock);
+    gDrawEnabled = NO;
     gCurrentClassName = [tt.fullName copy];
     gCurrentComment = [tt.comment copy];
-    gDrawEnabled = NO;
     os_unfair_lock_unlock(&gScanLock);
 
     Il2CppClass *cls = CFTFindGameClass(tt);     // 自动获取类与对象校验
     CFTLog(@"选择类 %@（%@）类=%@ 摄像机=%p",
            tt.fullName, tt.comment, cls ? @"已获取" : @"未找到", gMainCamera);
-    // 切类后再做一次统一清理，覆盖最小化/绘制开关/Overlay 的残留状态。
-    CFTCleanupDrawState();
 }
 
 #pragma mark - 矩形开关（安卓风格，非系统 UISwitch）
@@ -840,7 +843,6 @@ static void CFTSelectTarget(CFTTarget *tt) {
 static UIWindow *gMenuWindow;
 static UIView *gPanel;
 static NSMutableArray<UIButton*> *gClassButtons;
-static CFTSwitch *gSwDraw;
 static CFTSwitch *gSwBox;
 static CFTSwitch *gSwName;
 static CFTSwitch *gSwDist;
