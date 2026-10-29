@@ -1063,25 +1063,26 @@ static UIView *gBtnHostView;
 }
 @end
 
-// 悬浮球不新建 UIWindow：某些 Scene/Unity 主窗口生命周期下独立小窗口可能不会上屏。
-// 直接把小球挂到当前可见主窗口 root view，确保可见，同时保留 tap/pan。
+// 悬浮球挂到游戏主 window 本身（不是 rootViewController.view）。
+// Unity 的 RootViewController.view 常常 userInteractionEnabled=NO（触摸全交给渲染视图），
+// 挂在它上面的球会“可见但收不到任何事件”。window 默认可交互，作为其最顶层 subview 才能稳定命中 tap/pan。
 static UIView* CFTVisibleHostView(void) {
+    NSArray<UIWindow *> *wins = UIApplication.sharedApplication.windows;
     UIWindow *key = UIApplication.sharedApplication.keyWindow;
-    if (key && !key.hidden && key.rootViewController && key.rootViewController.view) {
-        return key.rootViewController.view;
+    if (key && !key.hidden && key.rootViewController &&
+        key != gMenuWindow && key != gOverlayWindow) {
+        return key;
     }
-    for (UIWindow *w in UIApplication.sharedApplication.windows) {
+    for (UIWindow *w in wins) {
         if (w.hidden) continue;
-        if (w.rootViewController && w.rootViewController.view) {
-            return w.rootViewController.view;
-        }
-    }
-    if (key) return key;
-    for (UIWindow *w in UIApplication.sharedApplication.windows) {
-        if (!w.hidden) return w;
+        if (w == gMenuWindow || w == gOverlayWindow) continue;
+        if (!w.rootViewController) continue;   // 跳过 status bar 等系统窗口
+        return w;
     }
     return nil;
 }
+
+static NSTimer *gBtnTopTimer;
 
 static void CFTSetupButton(void) {
     UIView *host = CFTVisibleHostView();
@@ -1133,6 +1134,12 @@ static void CFTSetupButton(void) {
 
     [host addSubview:gBtn];
     [host bringSubviewToFront:gBtn];
+    // 低频置顶：防止 Unity 后续 addSubview 把球盖到下层导致不可点。
+    if (!gBtnTopTimer) {
+        gBtnTopTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t){
+            if (gBtn && gBtn.superview) [gBtn.superview bringSubviewToFront:gBtn];
+        }];
+    }
     CFTLog(@"悬浮球已挂载到 host=%@ frame=%@ hostSize=%@", [host class],
            NSStringFromCGRect(gBtn.frame), NSStringFromCGSize(host.bounds.size));
 }
