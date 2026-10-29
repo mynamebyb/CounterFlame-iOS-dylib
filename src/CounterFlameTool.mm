@@ -487,15 +487,18 @@ static UIWindowScene* CFTActiveWindowScene(void) {
 
 @end
 
-// 悬浮球专用窗口：只在“球视图真正 bounds”内命中，绝不兜底 rootVC/window 区域。
-// 如果点落在 56x56 球窗外，直接返回 nil，让事件继续交给下层窗口/游戏，避免吞全屏触摸。
+// 悬浮球专用窗口：只在“球圆范围”内命中；圆外/窗口外全部穿透，避免吞全屏触摸。
 @interface CFTBallWindow : UIWindow
 @end
 
 @implementation CFTBallWindow
 
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    return CGRectContainsPoint(self.bounds, point);
+    if (!CGRectContainsPoint(self.bounds, point)) return NO;
+    CGFloat cx = self.bounds.size.width / 2.0;
+    CGFloat cy = self.bounds.size.height / 2.0;
+    // 半径 28 + 2pt 容差，保证边缘可点；圆外不命中
+    return hypot(point.x - cx, point.y - cy) <= 30.0;
 }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
