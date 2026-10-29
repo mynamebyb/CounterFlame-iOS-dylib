@@ -487,6 +487,25 @@ static UIWindowScene* CFTActiveWindowScene(void) {
 
 @end
 
+// 悬浮球专用窗口：只在“球视图真正 bounds”内命中，绝不兜底 rootVC/window 区域。
+// 如果点落在 56x56 球窗外，直接返回 nil，让事件继续交给下层窗口/游戏，避免吞全屏触摸。
+@interface CFTBallWindow : UIWindow
+@end
+
+@implementation CFTBallWindow
+
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    return CGRectContainsPoint(self.bounds, point);
+}
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (!self.isUserInteractionEnabled || self.isHidden) return nil;
+    if (![self pointInside:point withEvent:event]) return nil;
+    return [super hitTest:point withEvent:event];
+}
+
+@end
+
 // 构造触摸窗口：尝试绑定活跃 scene，失败则回退 initWithFrame。
 // window 初始 hidden=NO，确保注册进 UIApplication.windows 事件链。
 static UIWindow* CFTMakeTouchWindow(CGRect frame, UIWindowLevel level) {
@@ -1089,13 +1108,13 @@ static void CFTSetupButton(void) {
     CGSize sb = UIScreen.mainScreen.bounds.size;
     CGRect winFrame = CGRectMake(30, MAX(120, sb.height * 0.35), 56, 56);
 
-    gBtnWindow = [[CFTTouchWindow alloc] initWithWindowScene:ws];
+    gBtnWindow = [[CFTBallWindow alloc] initWithWindowScene:ws];
     gBtnWindow.frame = winFrame;
     gBtnWindow.windowLevel = UIWindowLevelAlert + 100;
     gBtnWindow.backgroundColor = UIColor.clearColor;
     gBtnWindow.userInteractionEnabled = YES;
     gBtnWindow.hidden = NO;
-    CFTLog(@"悬浮球：window 已建（scene=%@）frame=%@ level=%.0f", NSStringFromSelector(@selector(alloc)), NSStringFromCGRect(gBtnWindow.frame), (double)gBtnWindow.windowLevel);
+    CFTLog(@"悬浮球：window 已建（CFTBallWindow）frame=%@ level=%.0f", NSStringFromCGRect(gBtnWindow.frame), (double)gBtnWindow.windowLevel);
 
     gBtn = [[UIView alloc] initWithFrame:gBtnWindow.bounds];
     gBtn.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -1106,6 +1125,7 @@ static void CFTSetupButton(void) {
 
     UILabel *lab = [[UILabel alloc] initWithFrame:gBtn.bounds];
     lab.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    lab.userInteractionEnabled = NO;   // 不让 label 拦截手势，tap/pan 由 gBtn 上的 recognizer 处理
     lab.text = @"CF";
     lab.textColor = kCFTAccent;
     lab.font = [UIFont systemFontOfSize:18 weight:UIFontWeightBold];
