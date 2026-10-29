@@ -462,14 +462,15 @@ static UIWindowScene* CFTActiveWindowScene(void) {
 @implementation CFTTouchWindow
 
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    return YES;   // 整块窗口区域都算命中
+    return CGRectContainsPoint(self.bounds, point);   // 窗口外必须 NO，避免吞全屏
 }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     if (!self.isUserInteractionEnabled || self.isHidden) return nil;
+    if (!CGRectContainsPoint(self.bounds, point)) return nil;   // 窗口外穿透给下层
     UIView *hit = [super hitTest:point withEvent:event];
     if (hit) return hit;
-    // 空白区域回落到 rootViewController.view（面板自身），不让事件漏给游戏
+    // 窗口内空白区域回落到 rootViewController.view（面板自身），不让事件漏给游戏
     return self.rootViewController.view;
 }
 
