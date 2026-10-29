@@ -455,21 +455,24 @@ static UIWindowScene* CFTActiveWindowScene(void) {
     return fallback;
 }
 
-// 触摸接收窗口：整块矩形都是命中区，点空白不穿透到下层游戏窗口。
+// 触摸接收窗口：只在“窗口自身 bounds”内命中；窗口外必须返回 nil，让事件穿透给游戏。
+// 窗口内空白区允许由 rootViewController.view 承接（面板需要整块拦截触摸），
+// 但绝不会把屏幕其他区域的触摸吞进来。
 @interface CFTTouchWindow : UIWindow
 @end
 
 @implementation CFTTouchWindow
 
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    return YES;   // 整块窗口区域都算命中
+    return CGRectContainsPoint(self.bounds, point);
 }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     if (!self.isUserInteractionEnabled || self.isHidden) return nil;
+    if (!CGRectContainsPoint(self.bounds, point)) return nil;
     UIView *hit = [super hitTest:point withEvent:event];
     if (hit) return hit;
-    // 空白区域回落到 rootViewController.view（面板自身），不让事件漏给游戏
+    // 窗口内的空白区域回落到 rootViewController.view（面板自身），不让事件漏给游戏
     return self.rootViewController.view;
 }
 
@@ -487,27 +490,33 @@ static UIWindowScene* CFTActiveWindowScene(void) {
 
 @end
 
-// 悬浮球专用窗口：只在“球视图真正 bounds”内命中，绝不兜底 rootVC/window 区域。
-// 如果点落在 56x56 球窗外，直接返回 nil，让事件继续交给下层窗口/游戏，避免吞全屏触摸。
+// 悬浮球专用窗口：只在“球自身 bounds”命中，窗口外绝不命中；圆角之外的透明角落也穿透。
 @interface CFTBallWindow : UIWindow
 @end
 
 @implementation CFTBallWindow
 
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    return CGRectContainsPoint(self.bounds, point);
+    // 这里 point 是窗口本地坐标（UIKit hitTest 已在当前 window 坐标系下查询）
+    if (!CGRectContainsPoint(self.bounds, point)) return NO;
+    CGFloat cx = self.bounds.size.width / 2.0;
+    CGFloat cy = self.bounds.size.height / 2.0;
+    return hypot(point.x - cx, point.y - cy) <= 28.0;
 }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     if (!self.isUserInteractionEnabled || self.isHidden) return nil;
     if (![self pointInside:point withEvent:event]) return nil;
-    return [super hitTest:point withEvent:event];
+    UIView *hit = [super hitTest:point withEvent:event];
+    return hit;
 }
 
 @end
 
-// 构造触摸窗口：尝试绑定活跃 scene，失败则回退 initWithFrame。
-// window 初始 hidden=NO，确保注册进 UIApplication.windows 事件链。
+// 构造触摸窗口：优先绑定活跃 scene（Scene 架构下 initWithFrame: 可能不渲染）。
+// 拿不到 scene 时仍回退 initWithFrame:（面板允许回退，只是触摸可能不稳定）。
+// 关键修复：CFTTouchWindow.pointInside 已改为“只在窗口 bounds 内命中”，
+// 不会再把整屏触摸吞进面板窗口。
 static UIWindow* CFTMakeTouchWindow(CGRect frame, UIWindowLevel level) {
     UIWindow *w = nil;
     UIWindowScene *ws = CFTActiveWindowScene();
@@ -518,7 +527,7 @@ static UIWindow* CFTMakeTouchWindow(CGRect frame, UIWindowLevel level) {
     w.backgroundColor = UIColor.clearColor;
     w.userInteractionEnabled = YES;
     w.hidden = NO;   // 立即可见，注册进事件链
-    CFTLog(@"建立触摸窗口 frame=%@ level=%.0f scene=%@",
+    CFTLog(@"建立触摸窗口 frame=%@ level=%.0f scene=%@ pointInside=严格bounds",
            NSStringFromCGRect(frame), (double)level, ws ? @"已绑定" : @"无(回退)");
     return w;
 }
