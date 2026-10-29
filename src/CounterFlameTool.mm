@@ -19,6 +19,7 @@
 #import <dlfcn.h>
 #import <math.h>
 #import <string.h>
+#import <os/lock.h>
 
 #pragma mark - il2cpp 类型
 
@@ -134,6 +135,8 @@ static BOOL gShowBox = NO;
 static BOOL gShowName = NO;
 static BOOL gShowDistance = NO;
 static BOOL gShowRay = NO;
+static os_unfair_lock gScanLock = OS_UNFAIR_LOCK_INIT;   // 保护扫描/开关状态跨线程读写
+static BOOL gScanInProgress = NO;                        // 防止扫描重入
 
 #pragma mark - 固定类配置
 
@@ -341,7 +344,7 @@ static void CFTGetCamera(void) {
 @end
 @implementation CFTItem @end
 
-static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt) {
+static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt, NSInteger index) {
     NSMutableArray *items = [NSMutableArray array];
     if (!gReady || !targetClass) return items;
 
@@ -434,7 +437,12 @@ static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt)
         item.point = pt;
         item.valid = valid;
         item.distance = dist;
-        item.label = [NSString stringWithFormat:@"%@", tt.comment];
+        // 武器/物品类目标不显示“物品 1/物品 2”，有具体名称才分类显示，否则统一显示“武器”。
+        if ([tt.fullName hasPrefix:@"UnityEngine."] || [tt.comment hasPrefix:@"物品"]) {
+            item.label = @"武器";
+        } else {
+            item.label = [NSString stringWithFormat:@"%@ #%ld", tt.comment, (long)(index + 1)];
+        }
         [items addObject:item];
     }
     return items;
@@ -614,17 +622,27 @@ static void CFTSetupOverlay(void) {
 #pragma mark - 扫描定时
 
 static NSTimer *gScanTimer;
+static void CFTCleanupDrawState(void);   // 前向声明，供 onMinimize 等 UI 回调使用
 
 static void CFTRefreshScan(void) {
-    if (!gReady || !gDrawEnabled || !gCurrentClassName) return;
+    os_unfair_lock_lock(&gScanLock);
+    if (!gReady || !gDrawEnabled || !gCurrentClassName || gScanInProgress) {
+        os_unfair_lock_unlock(&gScanLock);
+        return;
+    }
+    gScanInProgress = YES;
     CFTTarget *tt = nil;
     for (CFTTarget *t in CFTTargets()) {
         if ([t.fullName isEqualToString:gCurrentClassName]) { tt = t; break; }
     }
-    if (!tt) return;
-
+    if (!tt) {
+        os_unfair_lock_unlock(&gScanLock);
+        return;
+    }
     Il2CppClass *cls = CFTFindGameClass(tt);   // 每轮重新获取类
     if (!cls) {
+        gScanInProgress = NO;
+        os_unfair_lock_unlock(&gScanLock);
         CFTLog(@"未找到类 %@，清空旧结果防止野指针", tt.fullName);
         // 类暂时找不到时，清空旧 items，避免用上一轮可能已失效的指针继续画
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -632,7 +650,14 @@ static void CFTRefreshScan(void) {
         });
         return;
     }
-    NSArray<CFTItem*> *items = CFTBuildItems(cls, tt);
+    NSUInteger idx = 0;
+    for (CFTTarget *t in CFTTargets()) {
+        if ([t.fullName isEqualToString:tt.fullName]) break;
+        idx++;
+    }
+    NSArray<CFTItem*> *items = CFTBuildItems(cls, tt, (NSInteger)idx);
+    gScanInProgress = NO;
+    os_unfair_lock_unlock(&gScanLock);
     dispatch_async(dispatch_get_main_queue(), ^{
         CFTSetupOverlay();
         gOverlayWindow.hidden = NO;
@@ -641,25 +666,35 @@ static void CFTRefreshScan(void) {
 }
 
 static void CFTStopScanTimer(void) {
-    if (gScanTimer) {
-        [gScanTimer invalidate];
-        gScanTimer = nil;
+    os_unfair_lock_lock(&gScanLock);
+    NSTimer *tmr = gScanTimer;
+    gScanTimer = nil;
+    os_unfair_lock_unlock(&gScanLock);
+    if (tmr) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [tmr invalidate];
+        });
         CFTLog(@"扫描定时器已停止");
     }
 }
 
-static void CFTSelectTarget(CFTTarget *tt) {
-    CFTAttach();
-    CFTInit();
-    CFTGetCamera();                              // 点类名同时自动重新获取摄像机
-    CFTStopScanTimer();                          // 切目标前先停旧定时器，避免旧类名轮询
-    gCurrentClassName = tt.fullName;
-    gCurrentComment = tt.comment;
-
-    Il2CppClass *cls = CFTFindGameClass(tt);     // 自动获取类与对象校验
-    CFTLog(@"选择类 %@（%@）类=%@ 摄像机=%p",
-           tt.fullName, tt.comment, cls ? @"已获取" : @"未找到", gMainCamera);
-
+static void CFTStartScanTimer(void) {
+    // 只在主线程创建 NSTimer；后台线程启定时器是二开闪退的主因之一。
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            CFTStartScanTimer();
+        });
+        return;
+    }
+    os_unfair_lock_lock(&gScanLock);
+    if (gScanTimer) {
+        os_unfair_lock_unlock(&gScanLock);
+        return;
+    }
+    if (!gDrawEnabled || !gCurrentClassName) {
+        os_unfair_lock_unlock(&gScanLock);
+        return;
+    }
     gScanTimer = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES
                                                  block:^(NSTimer *t) {
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -667,7 +702,44 @@ static void CFTSelectTarget(CFTTarget *tt) {
             CFTRefreshScan();
         });
     }];
-    CFTRefreshScan();
+    os_unfair_lock_unlock(&gScanLock);
+    CFTLog(@"扫描定时器已启动");
+}
+
+// 公共清理函数：停定时器、关总绘制、清屏幕 items。切类名/关开关/最小化时都应调用，
+// 避免旧定时器继续轮询旧类名导致的野指针闪退。
+static void CFTCleanupDrawState(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            CFTCleanupDrawState();
+        });
+        return;
+    }
+    CFTStopScanTimer();
+    gDrawEnabled = NO;
+    if (gOverlayView) gOverlayView.items = @[];
+    if (gOverlayWindow) gOverlayWindow.hidden = YES;
+    if (gSwDraw) gSwDraw.on = NO;
+    CFTUpdateSubSwitches();
+}
+
+static void CFTSelectTarget(CFTTarget *tt) {
+    CFTAttach();
+    CFTInit();
+    CFTGetCamera();                              // 点类名同时自动重新获取摄像机
+    // 先停旧定时器并复位绘制状态，再切换类名，避免旧类名定时器在窗口期继续运行。
+    CFTCleanupDrawState();
+    os_unfair_lock_lock(&gScanLock);
+    gCurrentClassName = [tt.fullName copy];
+    gCurrentComment = [tt.comment copy];
+    gDrawEnabled = NO;
+    os_unfair_lock_unlock(&gScanLock);
+
+    Il2CppClass *cls = CFTFindGameClass(tt);     // 自动获取类与对象校验
+    CFTLog(@"选择类 %@（%@）类=%@ 摄像机=%p",
+           tt.fullName, tt.comment, cls ? @"已获取" : @"未找到", gMainCamera);
+    // 切类后再做一次统一清理，覆盖最小化/绘制开关/Overlay 的残留状态。
+    CFTCleanupDrawState();
 }
 
 #pragma mark - 矩形开关（安卓风格，非系统 UISwitch）
@@ -719,6 +791,21 @@ static void CFTSelectTarget(CFTTarget *tt) {
     _on = !_on;
     [self applyVisual:YES];
     if (self.changed) self.changed(_on);
+}
+
+// 扩大可点击区域：整个开关行都算命中，降低断触概率。
+// pointInside 使用自身坐标系：外扩 10pt 命中区（左右各 10，上下各 10）。
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    CGRect hit = CGRectInset(self.bounds, -10, -10);
+    return CGRectContainsPoint(hit, point);
+}
+
+// hitTest 统一走父级转换后的本地坐标，命中开关本体或外扩区都返回 self，
+// 避免边缘触摸漏给父级导致断触/按钮误触。
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    CGPoint local = [self convertPoint:point toView:self];
+    if (![self pointInside:local withEvent:event]) return nil;
+    return self;
 }
 
 @end
@@ -791,9 +878,7 @@ static CFTSwitch *gSwRay;
 
 - (void)onMinimize {
     gMenuWindow.hidden = YES;
-    CFTStopScanTimer();                         // 最小化时暂停扫描
-    if (gOverlayView) gOverlayView.items = @[];
-    if (gOverlayWindow) gOverlayWindow.hidden = YES;
+    CFTCleanupDrawState();   // 最小化时暂停扫描并清屏
     CFTLog(@"菜单最小化，扫描已暂停");
 }
 
@@ -847,7 +932,9 @@ static void CFTUpdateSubSwitches(void) {
 static void CFTMenuBuild(void) {
     if (gMenuWindow) return;
 
-    const CGFloat W = 285, H = 446;
+    // 内容可滚动，避免在小屏上被截断；窗口高度保持 446，内部滚动区为 360。
+    const CGFloat W = 285, H = 446, scrollH = H - 36;   // 36 是标题栏高度
+    const CGFloat contentH = 360;                        // 内容实际高度，尽量不依赖滚动
     CGRect defaultFrame = CGRectMake(35, 90, W, H);
 
     // 面板窗口层级高于悬浮球窗口，避免面板被小球窗口压住
@@ -891,16 +978,28 @@ static void CFTMenuBuild(void) {
     mp.delegate = gMenuController;  // 控件上的触摸不触发拖动
     [gPanel addGestureRecognizer:mp];
 
-    // 分组：目标类
-    [gPanel addSubview:CFTMakeLabel(CGRectMake(12, 44, 200, 12),
-                                    @"目标类（点击自动获取）", kCFTSUB,
-                                    UIFontWeightRegular, 11)];
+    // 滚动区：从标题栏下方开始，可上下滚动查看完整功能。
+    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 36, W, scrollH)];
+    scroll.backgroundColor = kCFTBg;
+    scroll.showsVerticalScrollIndicator = YES;
+    scroll.showsHorizontalScrollIndicator = NO;
+    scroll.contentInset = UIEdgeInsetsMake(0, 0, 12, 0);
+    UIView *content = [[UIView alloc] initWithFrame:CGRectMake(0, 0, W, contentH)];
+    content.backgroundColor = kCFTBg;
+    scroll.contentSize = content.bounds.size;
+    [scroll addSubview:content];
+    [gPanel addSubview:scroll];
+
+    // 分组：目标类（相对滚动内容，y 从 0 开始）
+    [content addSubview:CFTMakeLabel(CGRectMake(12, 8, 200, 12),
+                                     @"目标类（点击自动获取）", kCFTSUB,
+                                     UIFontWeightRegular, 11)];
 
     gClassButtons = [NSMutableArray array];
     NSArray *targets = CFTTargets();
     for (NSUInteger i = 0; i < targets.count; i++) {
         CFTTarget *tt = targets[i];
-        CGFloat y = 60 + i * 40;
+        CGFloat y = 20 + i * 36;
         UIButton *b = CFTMakeRectButton(CGRectMake(12, y, W - 24, 34),
                                         [NSString stringWithFormat:@"%@  ·  %@",
                                                  tt.comment, tt.cls]);
@@ -909,25 +1008,25 @@ static void CFTMenuBuild(void) {
         [b addTarget:b action:@selector(cft_classTapped:)
                 forControlEvents:UIControlEventTouchUpInside];
         b.tag = (NSInteger)i;
-        [gPanel addSubview:b];
+        [content addSubview:b];
         [gClassButtons addObject:b];
     }
 
-    // 摄像机
-    UIButton *camBtn = CFTMakeRectButton(CGRectMake(12, 220, W - 24, 32),
+    // 摄像机（滚动内容内 y=170）
+    UIButton *camBtn = CFTMakeRectButton(CGRectMake(12, 170, W - 24, 30),
                                          @"重新获取摄像机");
     [camBtn addTarget:camBtn action:@selector(cft_cameraTapped)
                  forControlEvents:UIControlEventTouchUpInside];
-    [gPanel addSubview:camBtn];
+    [content addSubview:camBtn];
 
-    // 分隔
-    UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(12, 260, W - 24, 1)];
+    // 分隔（滚动内容内 y=210）
+    UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(12, 210, W - 24, 1)];
     sep.backgroundColor = kCFTLine;
-    [gPanel addSubview:sep];
+    [content addSubview:sep];
 
-    [gPanel addSubview:CFTMakeLabel(CGRectMake(12, 268, 100, 12),
-                                    @"绘制", kCFTSUB,
-                                    UIFontWeightRegular, 11)];
+    [content addSubview:CFTMakeLabel(CGRectMake(12, 218, 100, 12),
+                                     @"绘制", kCFTSUB,
+                                     UIFontWeightRegular, 11)];
 
     // 开关行
     NSArray *rows = @[
@@ -939,13 +1038,13 @@ static void CFTMenuBuild(void) {
     ];
     NSMutableArray *sws = [NSMutableArray array];
     for (NSUInteger i = 0; i < rows.count; i++) {
-        CGFloat y = 286 + i * 30;
-        [gPanel addSubview:CFTMakeLabel(CGRectMake(12, y, 160, 24),
-                                        rows[i][0], kCFTText,
-                                        UIFontWeightRegular, 12)];
+        CGFloat y = 236 + i * 28;   // 开关行在滚动内容内，保证底部完整可见
+        [content addSubview:CFTMakeLabel(CGRectMake(12, y, 160, 24),
+                                         rows[i][0], kCFTText,
+                                         UIFontWeightRegular, 12)];
         CFTSwitch *sw = [[CFTSwitch alloc] initWithFrame:CGRectMake(W - 12 - 46,
                                                                     y + 3, 46, 24)];
-        [gPanel addSubview:sw];
+        [content addSubview:sw];
         [sws addObject:sw];
     }
     gSwDraw = sws[0]; gSwBox = sws[1]; gSwName = sws[2];
@@ -965,20 +1064,10 @@ static void CFTMenuBuild(void) {
                 CFTLog(@"绘制开启但未选类，等待选择类后启动扫描");
             } else {
                 CFTRefreshScan();
-                if (!gScanTimer) {
-                    gScanTimer = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES
-                                                                 block:^(NSTimer *t) {
-                        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                            CFTAttach();
-                            CFTRefreshScan();
-                        });
-                    }];
-                }
+                CFTStartScanTimer();
             }
         } else {
-            CFTStopScanTimer();                  // 关绘制时停扫描，释放资源
-            gOverlayView.items = @[];
-            gOverlayWindow.hidden = YES;
+            CFTCleanupDrawState();              // 关绘制时停扫描并清屏，释放资源
         }
         CFTUpdateSubSwitches();
         CFTLog(@"绘制总开关 → %@", on ? @"开" : @"关");
@@ -1021,6 +1110,8 @@ static void CFTMenuBuild(void) {
     if ((NSUInteger)sender.tag >= targets.count) return;
     CFTTarget *tt = (CFTTarget*)targets[sender.tag];
     CFTLog(@"点击类名按钮：%@（%@）", tt.comment, tt.fullName);
+    // 切类前先清理 UI/定时器/绘制状态，避免旧定时器在后台继续跑旧类名。
+    CFTCleanupDrawState();
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         CFTAttach();
         CFTSelectTarget(tt);
