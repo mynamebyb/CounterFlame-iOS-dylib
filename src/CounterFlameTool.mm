@@ -504,7 +504,8 @@ static UIWindowScene* CFTActiveWindowScene(void) {
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     if (!self.isUserInteractionEnabled || self.isHidden) return nil;
     if (![self pointInside:point withEvent:event]) return nil;
-    return [super hitTest:point withEvent:event];
+    UIView *hit = [super hitTest:point withEvent:event];
+    return hit;
 }
 
 @end
