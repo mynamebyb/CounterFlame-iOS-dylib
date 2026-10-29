@@ -138,6 +138,14 @@ static BOOL gShowRay = NO;
 static os_unfair_lock gScanLock = OS_UNFAIR_LOCK_INIT;   // 保护扫描/开关状态跨线程读写
 static BOOL gScanInProgress = NO;                        // 防止扫描重入
 
+#pragma mark - CFTSwitch 接口前向声明（属性可见性，供 CFTCleanupDrawState 等使用）
+
+@interface CFTSwitch : UIControl
+@property(nonatomic, assign, getter=isOn) BOOL on;
+@property(nonatomic, copy) void (^changed)(BOOL on);
+@property(nonatomic, strong) UIView *knob;
+@end
+
 #pragma mark - 固定类配置
 
 @interface CFTTarget : NSObject
@@ -619,8 +627,6 @@ static void CFTSetupOverlay(void) {
     gOverlayWindow.hidden = !gDrawEnabled;
 }
 
-@class CFTSwitch;
-
 static CFTSwitch *gSwDraw;
 static void CFTUpdateSubSwitches(void);
 
@@ -746,12 +752,6 @@ static void CFTSelectTarget(CFTTarget *tt) {
 }
 
 #pragma mark - 矩形开关（安卓风格，非系统 UISwitch）
-
-@interface CFTSwitch : UIControl
-@property(nonatomic, assign, getter=isOn) BOOL on;
-@property(nonatomic, copy) void (^changed)(BOOL on);
-@property(nonatomic, strong) UIView *knob;
-@end
 
 @implementation CFTSwitch
 
