@@ -628,6 +628,7 @@ static void CFTSetupOverlay(void) {
 }
 
 static CFTSwitch *gSwDraw;
+static BOOL gSwDrawWasOn = NO;   // 用户是否曾打开总绘制，未选类时只记录意图，不启动扫描
 static void CFTUpdateSubSwitches(void);
 
 #pragma mark - 扫描定时
@@ -639,6 +640,8 @@ static void CFTRefreshScan(void) {
     os_unfair_lock_lock(&gScanLock);
     if (!gReady || !gDrawEnabled || !gCurrentClassName || gScanInProgress) {
         os_unfair_lock_unlock(&gScanLock);
+        if (gScanInProgress) CFTLog(@"扫描正在进行中，跳过本轮刷新");
+        else if (!gReady) CFTLog(@"il2cpp 未就绪，跳过扫描");
         return;
     }
     gScanInProgress = YES;
@@ -655,9 +658,14 @@ static void CFTRefreshScan(void) {
         gScanInProgress = NO;
         os_unfair_lock_unlock(&gScanLock);
         CFTLog(@"未找到类 %@，清空旧结果防止野指针", tt.fullName);
-        // 类暂时找不到时，清空旧 items，避免用上一轮可能已失效的指针继续画
+        // 类暂时找不到时，清空旧 items，避免用上一轮可能已失效的指针继续画。
+        // 只在总开关仍开且类未切换时清屏，避免把已被用户关掉的 UI 重新刷出来。
         dispatch_async(dispatch_get_main_queue(), ^{
-            gOverlayView.items = @[];
+            os_unfair_lock_lock(&gScanLock);
+            BOOL stillEnabled = gDrawEnabled;
+            BOOL sameClass = (gCurrentClassName && [gCurrentClassName isEqualToString:tt.fullName]);
+            os_unfair_lock_unlock(&gScanLock);
+            if (stillEnabled && sameClass && gOverlayView) gOverlayView.items = @[];
         });
         return;
     }
@@ -670,7 +678,15 @@ static void CFTRefreshScan(void) {
     gScanInProgress = NO;
     os_unfair_lock_unlock(&gScanLock);
     dispatch_async(dispatch_get_main_queue(), ^{
+        // 后台扫描期间用户可能已关总开关或切换类：只在状态一致时把结果写回 UI，
+        // 避免把旧 overlay / 旧类 items 刷回已清理的主线程造成野指针闪退。
+        os_unfair_lock_lock(&gScanLock);
+        BOOL stillEnabled = gDrawEnabled;
+        BOOL sameClass = (gCurrentClassName && [gCurrentClassName isEqualToString:tt.fullName]);
+        os_unfair_lock_unlock(&gScanLock);
+        if (!stillEnabled || !sameClass) return;
         CFTSetupOverlay();
+        if (!gOverlayWindow || !gOverlayView) return;
         gOverlayWindow.hidden = NO;
         gOverlayView.items = items;
     });
@@ -702,8 +718,12 @@ static void CFTStartScanTimer(void) {
         os_unfair_lock_unlock(&gScanLock);
         return;
     }
-    if (!gDrawEnabled || !gCurrentClassName) {
-        os_unfair_lock_unlock(&gScanLock);
+    BOOL drawOn = gDrawEnabled;
+    NSString *curCls = [gCurrentClassName copy];
+    os_unfair_lock_unlock(&gScanLock);
+
+    if (!drawOn || !curCls.length) {
+        CFTLog(@"扫描定时器未启动：drawOn=%d class=%@", drawOn, curCls);
         return;
     }
     gScanTimer = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES
@@ -713,7 +733,6 @@ static void CFTStartScanTimer(void) {
             CFTRefreshScan();
         });
     }];
-    os_unfair_lock_unlock(&gScanLock);
     CFTLog(@"扫描定时器已启动");
 }
 
@@ -727,11 +746,15 @@ static void CFTCleanupDrawState(void) {
         return;
     }
     CFTStopScanTimer();
+    os_unfair_lock_lock(&gScanLock);
     gDrawEnabled = NO;
+    gScanInProgress = NO;
+    os_unfair_lock_unlock(&gScanLock);
     if (gOverlayView) gOverlayView.items = @[];
     if (gOverlayWindow) gOverlayWindow.hidden = YES;
     if (gSwDraw) gSwDraw.on = NO;
     CFTUpdateSubSwitches();
+    CFTLog(@"绘制状态已清理");
 }
 
 static void CFTSelectTarget(CFTTarget *tt) {
@@ -742,6 +765,7 @@ static void CFTSelectTarget(CFTTarget *tt) {
     CFTCleanupDrawState();
     os_unfair_lock_lock(&gScanLock);
     gDrawEnabled = NO;
+    gScanInProgress = NO;
     gCurrentClassName = [tt.fullName copy];
     gCurrentComment = [tt.comment copy];
     os_unfair_lock_unlock(&gScanLock);
@@ -749,6 +773,10 @@ static void CFTSelectTarget(CFTTarget *tt) {
     Il2CppClass *cls = CFTFindGameClass(tt);     // 自动获取类与对象校验
     CFTLog(@"选择类 %@（%@）类=%@ 摄像机=%p",
            tt.fullName, tt.comment, cls ? @"已获取" : @"未找到", gMainCamera);
+
+    // 注意：这里不自动恢复 Overlay/扫描。切类先做 cleanup，把旧定时器、旧 overlay 数据、
+    // gDrawEnabled 全部复位；用户再手动打开总绘制时，gSwDraw.changed 会在已选新类的状态下
+    // 安全启动扫描。避免“用户已关总绘制”或“切类窗口期”里旧扫描线程继续写回旧类结果。
 }
 
 #pragma mark - 矩形开关（安卓风格，非系统 UISwitch）
@@ -825,12 +853,15 @@ static void CFTSelectTarget(CFTTarget *tt) {
 }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    // 子视图优先：按钮/开关/ScrollView 自己处理触摸和手势；
+    // 只有空白区域才交给面板吞掉，防止穿透到游戏，同时保留 UIScrollView 滚动能力。
+    if (!CGRectContainsPoint(self.bounds, point)) return nil;
     UIView *hit = [super hitTest:point withEvent:event];
-    if (hit) return hit;          // 子控件（按钮/开关）优先
-    return self;                  // 空白区域由面板自己接下，不交给下层窗口
+    if (hit) return hit;
+    return self;
 }
 
-// 兜底：空白处的触摸被面板吞掉（不做任何事），确保不会落到游戏视图上。
+// 兜底：空白处的触摸由面板吞掉，不落到游戏视图；滚动区会命中 UIScrollView，因此仍允许其处理拖动。
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {}
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {}
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {}
@@ -934,10 +965,12 @@ static void CFTUpdateSubSwitches(void) {
 static void CFTMenuBuild(void) {
     if (gMenuWindow) return;
 
-    // 内容可滚动，避免在小屏上被截断；窗口高度保持 446，内部滚动区为 360。
-    const CGFloat W = 285, H = 446, scrollH = H - 36;   // 36 是标题栏高度
-    const CGFloat contentH = 360;                        // 内容实际高度，尽量不依赖滚动
-    CGRect defaultFrame = CGRectMake(35, 90, W, H);
+    // 内容可滚动，避免在小屏上被截断；窗口高度按屏幕可用高度自适应，滚动区视口小于内容高度 500pt。
+    CGFloat screenH = UIScreen.mainScreen.bounds.size.height;
+    const CGFloat H = MIN(460.0, MAX(320.0, screenH - 160.0));
+    const CGFloat W = 285, scrollH = H - 36;   // 36 是标题栏高度
+    const CGFloat contentH = 500;             // 内容实际高度，大于滚动视口才出现滚动条
+    CGRect defaultFrame = CGRectMake(35, MAX(20.0, (screenH - H) / 2.0), W, H);
 
     // 面板窗口层级高于悬浮球窗口，避免面板被小球窗口压住
     gMenuWindow = CFTMakeTouchWindow(defaultFrame, UIWindowLevelStatusBar + 450);
@@ -971,26 +1004,32 @@ static void CFTMenuBuild(void) {
 
     [gPanel addSubview:bar];
 
-    // 整块面板可拖动（标题栏不再单独挂手势，避免拖动量叠加）
+    // 面板拖动只挂标题栏，避免整块 panel 的 UIPanGestureRecognizer 吞掉 UIScrollView 手势。
     UIPanGestureRecognizer *mp = [[UIPanGestureRecognizer alloc]
         initWithTarget:gMenuController action:@selector(onMenuPan:)];
     mp.cancelsTouchesInView = NO;   // 不取消按钮/开关的点击
     mp.delaysTouchesBegan = NO;
     mp.maximumNumberOfTouches = 1;
-    mp.delegate = gMenuController;  // 控件上的触摸不触发拖动
-    [gPanel addGestureRecognizer:mp];
+    [bar addGestureRecognizer:mp];
 
     // 滚动区：从标题栏下方开始，可上下滚动查看完整功能。
     UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 36, W, scrollH)];
     scroll.backgroundColor = kCFTBg;
     scroll.showsVerticalScrollIndicator = YES;
     scroll.showsHorizontalScrollIndicator = NO;
-    scroll.contentInset = UIEdgeInsetsMake(0, 0, 12, 0);
+    scroll.contentInset = UIEdgeInsetsMake(0, 0, 24, 0);
+    scroll.scrollIndicatorInsets = UIEdgeInsetsMake(4, 0, 4, 0);
+    scroll.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     UIView *content = [[UIView alloc] initWithFrame:CGRectMake(0, 0, W, contentH)];
     content.backgroundColor = kCFTBg;
     scroll.contentSize = content.bounds.size;
     [scroll addSubview:content];
     [gPanel addSubview:scroll];
+    CFTLog(@"菜单滚动区 frame=%@ contentSize=%@ viewport=%@ contentH=%.0f scrollH=%.0f",
+           NSStringFromCGRect(scroll.frame),
+           NSStringFromCGSize(scroll.contentSize),
+           NSStringFromCGRect(scroll.bounds),
+           contentH, scrollH);
 
     // 分组：目标类（相对滚动内容，y 从 0 开始）
     [content addSubview:CFTMakeLabel(CGRectMake(12, 8, 200, 12),
@@ -1057,17 +1096,29 @@ static void CFTMenuBuild(void) {
     gSwDist.on = gShowDistance; gSwRay.on = gShowRay;
 
     gSwDraw.changed = ^(BOOL on) {
-        gDrawEnabled = on;
+        // 主线程改全局状态时持锁，避免后台扫描线程同时读到半更新状态导致闪退。
+        // 未选目标类时只记录用户意图，不把 gDrawEnabled 置真：Overlay/扫描都还没建立，
+        // 否则后台扫描线程会误认为绘制已就绪并访问未初始化对象。
+        gSwDrawWasOn = on;
+        os_unfair_lock_lock(&gScanLock);
+        BOOL canScan = on && gCurrentClassName.length > 0;
+        gDrawEnabled = canScan;
+        os_unfair_lock_unlock(&gScanLock);
         if (on) {
-            CFTSetupOverlay();
-            gOverlayWindow.hidden = NO;
-            [gOverlayView setNeedsDisplay];
-            if (!gCurrentClassName) {
-                CFTLog(@"绘制开启但未选类，等待选择类后启动扫描");
-            } else {
+            // 所有 UIKit 操作统一回主线程；未选目标类时不创建 Overlay、不启动扫描，避免空指针。
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (!gCurrentClassName) {
+                    CFTLog(@"绘制总开关已开，但未选择目标类；先选类后再开启扫描");
+                    CFTUpdateSubSwitches();
+                    return;
+                }
+                CFTSetupOverlay();
+                if (gOverlayWindow) gOverlayWindow.hidden = NO;
+                if (gOverlayView) [gOverlayView setNeedsDisplay];
                 CFTRefreshScan();
                 CFTStartScanTimer();
-            }
+                if (gSwDraw) gSwDraw.on = YES;
+            });
         } else {
             CFTCleanupDrawState();              // 关绘制时停扫描并清屏，释放资源
         }
@@ -1075,19 +1126,23 @@ static void CFTMenuBuild(void) {
         CFTLog(@"绘制总开关 → %@", on ? @"开" : @"关");
     };
     gSwBox.changed = ^(BOOL on) {
-        gShowBox = on; [gOverlayView setNeedsDisplay];
+        gShowBox = on;
+        if (gOverlayView) [gOverlayView setNeedsDisplay];
         CFTLog(@"开关 方框 → %@", on ? @"开" : @"关");
     };
     gSwName.changed = ^(BOOL on) {
-        gShowName = on; [gOverlayView setNeedsDisplay];
+        gShowName = on;
+        if (gOverlayView) [gOverlayView setNeedsDisplay];
         CFTLog(@"开关 名字 → %@", on ? @"开" : @"关");
     };
     gSwDist.changed = ^(BOOL on) {
-        gShowDistance = on; [gOverlayView setNeedsDisplay];
+        gShowDistance = on;
+        if (gOverlayView) [gOverlayView setNeedsDisplay];
         CFTLog(@"开关 距离 → %@", on ? @"开" : @"关");
     };
     gSwRay.changed = ^(BOOL on) {
-        gShowRay = on; [gOverlayView setNeedsDisplay];
+        gShowRay = on;
+        if (gOverlayView) [gOverlayView setNeedsDisplay];
         CFTLog(@"开关 射线 → %@", on ? @"开" : @"关");
     };
 
