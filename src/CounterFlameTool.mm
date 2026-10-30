@@ -346,15 +346,26 @@ static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt,
     Il2CppArray *arr = (Il2CppArray*)arrObj;
     int32_t n = fn_array_length ? fn_array_length(arr) : 0;
 
+    // ▼ 修复物品闪退：非法/过大数量直接丢弃，避免野指针遍历
+    if (n < 0 || n > 256) {
+        CFTLog(@"%@ 数组数量异常 n=%d，跳过", tt.fullName, n);
+        return items;
+    }
+
     CFTGetCamera();
     Il2CppObject *cam = gMainCamera;
 
     struct CFT_Vec3 camPos = {0,0,0};
     if (cam && gCameraGetPosition && fn_object_unbox) {
-        Il2CppObject *box = CFTInvoke(gCameraGetPosition, cam, NULL);
-        if (box) {
-            struct CFT_Vec3 *p = (struct CFT_Vec3*)fn_object_unbox(box);
-            if (p) camPos = *p;
+        @try {
+            Il2CppObject *box = CFTInvoke(gCameraGetPosition, cam, NULL);
+            if (box) {
+                struct CFT_Vec3 *p = (struct CFT_Vec3*)fn_object_unbox(box);
+                if (p) camPos = *p;
+            }
+        } @catch (NSException *e) {
+            CFTLog(@"获取摄像机位置异常：%@", e.reason);
+            cam = nil;
         }
     }
 
@@ -363,62 +374,82 @@ static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt,
     CGFloat screenW = gScreenW;
     BOOL human = CFTIsHumanTarget(tt);
 
+    // ▼ 物品类对象可能存在已销毁实例（主界面尤其多），对每个对象调用用 @try 兜底
     for (int32_t i = 0; i < n; i++) {
-        Il2CppObject *elem = CFTArrayElem(arr, i);
-        if (!elem) continue;
+        @autoreleasepool {
+            @try {
+                Il2CppObject *elem = CFTArrayElem(arr, i);
+                if (!elem) continue;
 
-        Il2CppObject *transform = NULL;
-        struct CFT_Vec3 wpos = {0,0,0};
+                // 跳过可能已被 Unity 销毁的对象（野指针）
+                // il2cpp 没有 isAlive 导出，只能通过 fn_object_get_class 间接校验
+                if (fn_object_get_class) {
+                    Il2CppClass *ec = fn_object_get_class(elem);
+                    if (!ec) continue;  // 已销毁对象通常 class 指针为空或无效
+                }
 
-        if (gGetTransform) transform = CFTInvoke(gGetTransform, elem, NULL);
-        if (transform && gGetPosition && fn_object_unbox) {
-            Il2CppObject *pb = CFTInvoke(gGetPosition, transform, NULL);
-            if (pb) {
-                struct CFT_Vec3 *p = (struct CFT_Vec3*)fn_object_unbox(pb);
-                if (p) wpos = *p;
-            }
-        }
-        // ▼ 人物 Transform 在脚底，世界坐标抬高半身高，投影随距离自然缩放
-        if (human) wpos.y += kCFTHumanLift;
+                Il2CppObject *transform = NULL;
+                struct CFT_Vec3 wpos = {0,0,0};
 
-        float dx = wpos.x - camPos.x;
-        float dy = wpos.y - camPos.y;
-        float dz = wpos.z - camPos.z;
-        double dist = sqrt(dx*dx + dy*dy + dz*dz);
+                if (gGetTransform) transform = CFTInvoke(gGetTransform, elem, NULL);
+                if (!transform) continue;   // 对象无效，拿不到 transform
 
-        CGPoint pt = CGPointZero;
-        BOOL valid = NO;
-        if (cam && gWorldToScreenPoint && fn_object_unbox) {
-            struct CFT_Vec3 arg = wpos;
-            void *argp = &arg;
-            Il2CppObject *sb = CFTInvoke(gWorldToScreenPoint, cam, &argp);
-            if (sb) {
-                struct CFT_Vec3 *sp = (struct CFT_Vec3*)fn_object_unbox(sb);
-                if (sp) {
-                    // ▼ 修复背向误绘：z<=0 表示目标在摄像机背后，
-                    //   其 x/y 投影会镜像到屏幕另一侧（180° 方向），必须丢弃
-                    if (sp->z > 0.0f) {
-                        CGFloat px = sp->x / scale;
-                        CGFloat py = (screenH * scale - sp->y) / scale;
-                        if (px >= 0 && px <= screenW && py >= 0 && py <= screenH) {
-                            pt = CGPointMake(px, py);
-                            valid = YES;
+                if (gGetPosition && fn_object_unbox) {
+                    Il2CppObject *pb = CFTInvoke(gGetPosition, transform, NULL);
+                    if (pb) {
+                        struct CFT_Vec3 *p = (struct CFT_Vec3*)fn_object_unbox(pb);
+                        if (p) wpos = *p;
+                    }
+                }
+                // ▼ 人物 Transform 在脚底，世界坐标抬高半身高，投影随距离自然缩放
+                if (human) wpos.y += kCFTHumanLift;
+
+                // 坐标合理性检查：距离超大或 NaN 说明数据异常
+                if (!isfinite(wpos.x) || !isfinite(wpos.y) || !isfinite(wpos.z)) continue;
+                if (fabsf(wpos.x) > 10000 || fabsf(wpos.y) > 10000 || fabsf(wpos.z) > 10000) continue;
+
+                float dx = wpos.x - camPos.x;
+                float dy = wpos.y - camPos.y;
+                float dz = wpos.z - camPos.z;
+                double dist = sqrt(dx*dx + dy*dy + dz*dz);
+
+                CGPoint pt = CGPointZero;
+                BOOL valid = NO;
+                if (cam && gWorldToScreenPoint && fn_object_unbox) {
+                    struct CFT_Vec3 arg = wpos;
+                    void *argp = &arg;
+                    Il2CppObject *sb = CFTInvoke(gWorldToScreenPoint, cam, &argp);
+                    if (sb) {
+                        struct CFT_Vec3 *sp = (struct CFT_Vec3*)fn_object_unbox(sb);
+                        if (sp && isfinite(sp->x) && isfinite(sp->y) && isfinite(sp->z)) {
+                            // ▼ 修复背向误绘：z<=0 表示目标在摄像机背后
+                            if (sp->z > 0.0f) {
+                                CGFloat px = sp->x / scale;
+                                CGFloat py = (screenH * scale - sp->y) / scale;
+                                if (px >= 0 && px <= screenW && py >= 0 && py <= screenH) {
+                                    pt = CGPointMake(px, py);
+                                    valid = YES;
+                                }
+                            }
                         }
                     }
                 }
+
+                CFTItem *item = [CFTItem new];
+                item.point = pt;
+                item.valid = valid;
+                item.distance = dist;
+                if (human) {
+                    item.label = [NSString stringWithFormat:@"%@ #%ld", tt.comment, (long)(index + 1)];
+                } else {
+                    item.label = @"物品";
+                }
+                [items addObject:item];
+            } @catch (NSException *e) {
+                // 单个对象异常不影响整体，跳过继续
+                continue;
             }
         }
-
-        CFTItem *item = [CFTItem new];
-        item.point = pt;
-        item.valid = valid;
-        item.distance = dist;
-        if (human) {
-            item.label = [NSString stringWithFormat:@"%@ #%ld", tt.comment, (long)(index + 1)];
-        } else {
-            item.label = @"物品";
-        }
-        [items addObject:item];
     }
     return items;
 }
