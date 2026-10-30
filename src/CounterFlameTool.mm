@@ -654,6 +654,11 @@ static void CFTCleanupDrawState(void);
 // 绝不把托管对象指针跨线程保存——只传 CGPoint/double/NSString。
 static void CFTKickScan(CFTTarget *tt) {
     dispatch_async(gScanQueue, ^{
+        // ▼ 修复"点绘制没效果"：dylib 加载通常早于 Unity 运行时启动，
+        //   构造器里的首次 CFTInit 会失败（gReady=NO）。旧版靠点击类名时
+        //   重试 init 兜底；上一版重写把它删了，导致永不重试。
+        //   现在每轮扫描都先重试 CFTInit（幂等：已就绪立即返回）。
+        CFTInit();
         CFTAttach();   // 幂等：确保本线程已挂到 il2cpp
         if (!gReady) {
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -690,7 +695,8 @@ static void CFTKickScan(CFTTarget *tt) {
 
 static void CFTRefreshScan(void) {
     os_unfair_lock_lock(&gScanLock);
-    if (!gReady || !gDrawEnabled || !gCurrentClassName || gScanInProgress) {
+    // ▼ 不再因 !gReady 直接跳过：发起扫描让扫描队列有机会重试初始化
+    if (!gDrawEnabled || !gCurrentClassName || gScanInProgress) {
         os_unfair_lock_unlock(&gScanLock);
         return;
     }
