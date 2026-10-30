@@ -241,15 +241,42 @@ static Il2CppObject* CFTTypeObject(const Il2CppType *t) {
     return NULL;
 }
 
-// 安全取数组元素：il2cpp 数组头部 32 字节，不能直接把数组指针当数据区
+// 安全取数组元素：优先使用 il2cpp_array_addr_with_size；缺失时不做硬编码偏移回退。
+// 不同 Unity 版本/架构下 Il2CppArray 头部大小可能不同，直接 +0x20 可能读野指针。
 static Il2CppObject* CFTArrayElem(Il2CppArray *arr, int32_t idx) {
-    if (!arr) return NULL;
-    if (fn_array_addr_with_size) {
-        void **slot = (void**)fn_array_addr_with_size(arr, (uint32_t)sizeof(void*),
-                                                      (uint32_t)idx);
-        return slot ? *slot : NULL;
+    if (!arr || !fn_array_addr_with_size) return NULL;
+    void **slot = (void**)fn_array_addr_with_size(arr, (uint32_t)sizeof(void*),
+                                                  (uint32_t)idx);
+    return slot ? *slot : NULL;
+}
+
+// 判断 il2cpp 对象是否“看起来有效”。用于过滤 Unity Fake Null：对象指针非 0，
+// 但内部已标记为 destroyed/invalid，继续调用 get_transform 可能让 Unity 抛异常/野指针。
+static BOOL CFTObjectLooksValid(Il2CppObject *obj) {
+    if (!obj) return NO;
+    // Unity 对象的 fake null 标记位于指针自身（而非解引用后），直接读指针值即可。
+    // 保守检查：指针为 0 或看起来是未对齐的哨兵值都返回 NO；
+    // 无法确定时交给 CFTInvokeSafe 的 @try/@catch 兜底。
+    uintptr_t v = (uintptr_t)obj;
+    if (v == 0) return NO;
+    // Unity 的 kInvalidObject 通常为 0 或 0x7FFFFFFF；
+    // 某些版本会用哨兵值（如 0xFFFFFFFFFFFFFFFF）表示 invalid。
+    if (v == 0x7FFFFFFFUL || v == 0xFFFFFFFFFFFFFFFFUL) return NO;
+    // 正常对象指针在 iOS 上不会恰好是 1（小整数）；
+    // 如果 il2cpp 数组里塞了哨兵值（如 1 或 -1），直接过滤。
+    if (v <= 4 || (v > (uintptr_t)4 && v < 0x1000)) return NO;
+    return YES;
+}
+
+// 带保护地调用 Unity 方法：il2cpp_runtime_invoke 可能抛出 .NET 异常（Unity Object 为
+// fake null、已销毁、类型不匹配等），必须 @try/@catch 包裹，否则后台线程崩进程。
+static Il2CppObject* CFTInvokeSafe(const MethodInfo *m, void *obj, void **params, const char *label) {
+    @try {
+        return CFTInvoke(m, obj, params);
+    } @catch (NSException *e) {
+        CFTLog(@"invoke 捕获异常 %@ (%s)", e.name, label);
+        return NULL;
     }
-    return ((Il2CppObject**)((char*)arr + 0x20))[idx];
 }
 
 #pragma mark - 初始化
@@ -384,6 +411,10 @@ static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt,
     Il2CppArray *arr = (Il2CppArray*)arrObj;
     int32_t n = fn_array_length ? fn_array_length(arr) : 0;
     CFTLog(@"扫描 %@ 命中 %d 个", tt.fullName, n);
+    if (!fn_array_addr_with_size) {
+        CFTLog(@"缺少 il2cpp_array_addr_with_size，无法安全读取数组元素，本轮返回空结果");
+        return items;
+    }
 
     CFTGetCamera();
     Il2CppObject *cam = gMainCamera;
@@ -403,14 +434,16 @@ static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt,
 
     for (int32_t i = 0; i < n; i++) {
         Il2CppObject *elem = CFTArrayElem(arr, i);
-        if (!elem) continue;
+        if (!elem || !CFTObjectLooksValid(elem)) continue;
 
         Il2CppObject *transform = NULL;
         struct CFT_Vec3 wpos = {0,0,0};
 
-        if (gGetTransform) transform = CFTInvoke(gGetTransform, elem, NULL);
+        // Unity 对象可能已销毁（fake null）或类型不匹配，调用 get_transform 会抛
+        // .NET 异常，后台线程未捕获会直接崩进程，逐个包裹。
+        transform = CFTInvokeSafe(gGetTransform, elem, NULL, "get_transform");
         if (transform && gGetPosition && fn_object_unbox) {
-            Il2CppObject *pb = CFTInvoke(gGetPosition, transform, NULL);
+            Il2CppObject *pb = CFTInvokeSafe(gGetPosition, transform, NULL, "get_position");
             if (pb) {
                 struct CFT_Vec3 *p = (struct CFT_Vec3*)fn_object_unbox(pb);
                 if (p) wpos = *p;
@@ -427,7 +460,7 @@ static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt,
         if (cam && gWorldToScreenPoint && fn_object_unbox) {
             struct CFT_Vec3 arg = wpos;
             void *argp = &arg;
-            Il2CppObject *sb = CFTInvoke(gWorldToScreenPoint, cam, &argp);
+            Il2CppObject *sb = CFTInvokeSafe(gWorldToScreenPoint, cam, &argp, "WorldToScreenPoint");
             if (sb) {
                 struct CFT_Vec3 *sp = (struct CFT_Vec3*)fn_object_unbox(sb);
                 if (sp) {
@@ -617,6 +650,14 @@ static CFTOverlayView *gOverlayView;
 @end
 
 static void CFTSetupOverlay(void) {
+    // 创建 UIWindow/UIView/UIViewController 必须主线程；后台线程直接构造会
+    // 造成不可恢复的 UIKit 状态错乱，表现为偶发 EXC_BAD_ACCESS。
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            CFTSetupOverlay();
+        });
+        return;
+    }
     if (gOverlayWindow) return;
     gOverlayWindow = [[CFTPaintOnlyWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     gOverlayWindow.windowLevel = UIWindowLevelStatusBar + 300;
@@ -637,6 +678,8 @@ static NSTimer *gScanTimer;
 static void CFTCleanupDrawState(void);   // 前向声明，供 onMinimize 等 UI 回调使用
 
 static void CFTRefreshScan(void) {
+    // CFTRefreshScan 本身可在后台扫描线程执行：只读 Unity 对象并构建 items；
+    // 但凡创建/修改 UIKit Overlay，都必须统一派发到主线程，避免后台创建 UIWindow 导致闪退。
     os_unfair_lock_lock(&gScanLock);
     if (!gReady || !gDrawEnabled || !gCurrentClassName || gScanInProgress) {
         os_unfair_lock_unlock(&gScanLock);
@@ -650,6 +693,7 @@ static void CFTRefreshScan(void) {
         if ([t.fullName isEqualToString:gCurrentClassName]) { tt = t; break; }
     }
     if (!tt) {
+        gScanInProgress = NO;
         os_unfair_lock_unlock(&gScanLock);
         return;
     }
@@ -658,8 +702,6 @@ static void CFTRefreshScan(void) {
         gScanInProgress = NO;
         os_unfair_lock_unlock(&gScanLock);
         CFTLog(@"未找到类 %@，清空旧结果防止野指针", tt.fullName);
-        // 类暂时找不到时，清空旧 items，避免用上一轮可能已失效的指针继续画。
-        // 只在总开关仍开且类未切换时清屏，避免把已被用户关掉的 UI 重新刷出来。
         dispatch_async(dispatch_get_main_queue(), ^{
             os_unfair_lock_lock(&gScanLock);
             BOOL stillEnabled = gDrawEnabled;
@@ -677,6 +719,7 @@ static void CFTRefreshScan(void) {
     NSArray<CFTItem*> *items = CFTBuildItems(cls, tt, (NSInteger)idx);
     gScanInProgress = NO;
     os_unfair_lock_unlock(&gScanLock);
+    // 结果写回 UI 必须回主线程：gOverlayWindow / gOverlayView 是 UIKit 对象，后台线程直接 setNeedsDisplay / items 会崩。
     dispatch_async(dispatch_get_main_queue(), ^{
         // 后台扫描期间用户可能已关总开关或切换类：只在状态一致时把结果写回 UI，
         // 避免把旧 overlay / 旧类 items 刷回已清理的主线程造成野指针闪退。
@@ -1097,18 +1140,19 @@ static void CFTMenuBuild(void) {
 
     gSwDraw.changed = ^(BOOL on) {
         // 主线程改全局状态时持锁，避免后台扫描线程同时读到半更新状态导致闪退。
-        // 未选目标类时只记录用户意图，不把 gDrawEnabled 置真：Overlay/扫描都还没建立，
-        // 否则后台扫描线程会误认为绘制已就绪并访问未初始化对象。
+        // 未选目标类时不置 gDrawEnabled：避免后续 CFTRefreshScan 因 gCurrentClassName 为空而提前返回；
+        // 但 UI 保持“已开”态，记录用户意图（gSwDrawWasOn），选类后由 CFTSelectTarget 恢复扫描。
         gSwDrawWasOn = on;
         os_unfair_lock_lock(&gScanLock);
-        BOOL canScan = on && gCurrentClassName.length > 0;
-        gDrawEnabled = canScan;
+        BOOL hasClass = gCurrentClassName.length > 0;
+        gDrawEnabled = (on && hasClass) ? YES : NO;
         os_unfair_lock_unlock(&gScanLock);
         if (on) {
             // 所有 UIKit 操作统一回主线程；未选目标类时不创建 Overlay、不启动扫描，避免空指针。
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (!gCurrentClassName) {
                     CFTLog(@"绘制总开关已开，但未选择目标类；先选类后再开启扫描");
+                    // gDrawEnabled 保持 NO（见上方），避免 CFTRefreshScan 因 !gCurrentClassName 提前返回导致扫描器不启动
                     CFTUpdateSubSwitches();
                     return;
                 }
@@ -1127,22 +1171,22 @@ static void CFTMenuBuild(void) {
     };
     gSwBox.changed = ^(BOOL on) {
         gShowBox = on;
-        if (gOverlayView) [gOverlayView setNeedsDisplay];
+        if (gOverlayWindow && gOverlayView) [gOverlayView setNeedsDisplay];
         CFTLog(@"开关 方框 → %@", on ? @"开" : @"关");
     };
     gSwName.changed = ^(BOOL on) {
         gShowName = on;
-        if (gOverlayView) [gOverlayView setNeedsDisplay];
+        if (gOverlayWindow && gOverlayView) [gOverlayView setNeedsDisplay];
         CFTLog(@"开关 名字 → %@", on ? @"开" : @"关");
     };
     gSwDist.changed = ^(BOOL on) {
         gShowDistance = on;
-        if (gOverlayView) [gOverlayView setNeedsDisplay];
+        if (gOverlayWindow && gOverlayView) [gOverlayView setNeedsDisplay];
         CFTLog(@"开关 距离 → %@", on ? @"开" : @"关");
     };
     gSwRay.changed = ^(BOOL on) {
         gShowRay = on;
-        if (gOverlayView) [gOverlayView setNeedsDisplay];
+        if (gOverlayWindow && gOverlayView) [gOverlayView setNeedsDisplay];
         CFTLog(@"开关 射线 → %@", on ? @"开" : @"关");
     };
 
