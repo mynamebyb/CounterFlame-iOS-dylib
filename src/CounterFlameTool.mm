@@ -1,17 +1,3 @@
-//
-//  CounterFlameTool.mm — CounterFlame 内部测试工具（standalone 注入 dylib）
-//
-//  v2：安卓 libtool 风格实色面板（无液态玻璃）；修复触控穿透、选类闪退；
-//  选类自动获取类/对象/摄像机；绘制总开关默认关。
-//  v3：悬浮窗触摸修复——整块面板作为触摸接收区，空白区域拦截触摸不穿透到游戏；
-//  面板任意区域可拖动，不再局限于小圆点/标题栏。
-//  v4：触摸穿透根因修复——窗口绑定活跃 UIWindowScene（未绑定 scene 的窗口触摸
-//  投递不稳定，是穿透的根因）；触摸窗口整块命中+兜底拦截；ESP 绘制窗口改为
-//  纯渲染窗口彻底不拦触摸；面板窗口层级高于悬浮球；拖动只从空白区开始，
-//  控件上的触摸不触发拖动、点击不受影响。
-//  arm64 / arm64e 通用 fat dylib。
-//
-
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -67,15 +53,15 @@ static UIColor* CFTHex(unsigned int rgb, CGFloat a) {
                            green:((rgb >> 8) & 0xFF)/255.0
                             blue:(rgb & 0xFF)/255.0 alpha:a];
 }
-#define kCFTBg      CFTHex(0x0E1013, 0.98)   // 面板底
-#define kCFTBar     CFTHex(0x171A1F, 1.0)    // 标题栏
-#define kCFTLine    CFTHex(0x2B3038, 1.0)    // 边框/分隔
-#define kCFTBtn     CFTHex(0x1A1E23, 1.0)    // 按钮底
-#define kCFTBtnHi   CFTHex(0x23282F, 1.0)    // 按钮按下
-#define kCFTText    CFTHex(0xE6E8EB, 1.0)    // 主文字
-#define kCFTSUB     CFTHex(0x8A9099, 1.0)    // 次文字
-#define kCFTAccent  CFTHex(0xFF720F, 1.0)    // 品牌橙
-#define kCFTOff     CFTHex(0x262B33, 1.0)    // 开关关底
+#define kCFTBg      CFTHex(0x0E1013, 0.98)
+#define kCFTBar     CFTHex(0x171A1F, 1.0)
+#define kCFTLine    CFTHex(0x2B3038, 1.0)
+#define kCFTBtn     CFTHex(0x1A1E23, 1.0)
+#define kCFTBtnHi   CFTHex(0x23282F, 1.0)
+#define kCFTText    CFTHex(0xE6E8EB, 1.0)
+#define kCFTSUB     CFTHex(0x8A9099, 1.0)
+#define kCFTAccent  CFTHex(0xFF720F, 1.0)
+#define kCFTOff     CFTHex(0x262B33, 1.0)
 
 #pragma mark - 日志
 
@@ -130,13 +116,13 @@ static Il2CppObject *gMainCamera;
 
 static NSString *gCurrentClassName = nil;
 static NSString *gCurrentComment = nil;
-static BOOL gDrawEnabled = NO;   // 绘制总开关，默认关
+static BOOL gDrawEnabled = NO;
 static BOOL gShowBox = NO;
 static BOOL gShowName = NO;
 static BOOL gShowDistance = NO;
 static BOOL gShowRay = NO;
-static os_unfair_lock gScanLock = OS_UNFAIR_LOCK_INIT;   // 保护扫描/开关状态跨线程读写
-static BOOL gScanInProgress = NO;                        // 防止扫描重入
+static os_unfair_lock gScanLock = OS_UNFAIR_LOCK_INIT;
+static BOOL gScanInProgress = NO;
 
 #pragma mark - CFTSwitch 接口前向声明（属性可见性，供 CFTCleanupDrawState 等使用）
 
@@ -193,7 +179,6 @@ static Il2CppObject* CFTInvoke(const MethodInfo *m, void *obj, void **params) {
     Il2CppException *exc = NULL;
     Il2CppObject *r = fn_runtime_invoke(m, obj, params, &exc);
     if (exc) {
-        // 尽量把异常类名带出来，方便日志定位是哪类调用失败
         Il2CppClass *ec = fn_object_get_class ? fn_object_get_class((Il2CppObject*)exc) : NULL;
         const char *ename = (ec && fn_class_get_name) ? fn_class_get_name(ec) : "Unknown";
         CFTLog(@"invoke 异常 method=%p 类名=%s", m, ename ? ename : "Unknown");
@@ -229,54 +214,24 @@ static Il2CppClass* CFTFindGameClass(CFTTarget *tt) {
     return NULL;
 }
 
-// Il2CppType* -> C# System.Type 对象（FindObjectsOfType 需要的是对象，不是裸元数据指针）
 static Il2CppObject* CFTTypeObject(const Il2CppType *t) {
     if (!t) return NULL;
     if (fn_type_get_object) return fn_type_get_object(t);
     if (gTypeGetTypeFromHandle) {
-        // 兜底：Type.GetTypeFromHandle(RuntimeTypeHandle)，handle 内部值即 Il2CppType*
         void *handle = (void*)t;
         return CFTInvoke(gTypeGetTypeFromHandle, NULL, &handle);
     }
     return NULL;
 }
 
-// 安全取数组元素：优先使用 il2cpp_array_addr_with_size；缺失时不做硬编码偏移回退。
-// 不同 Unity 版本/架构下 Il2CppArray 头部大小可能不同，直接 +0x20 可能读野指针。
 static Il2CppObject* CFTArrayElem(Il2CppArray *arr, int32_t idx) {
-    if (!arr || !fn_array_addr_with_size) return NULL;
-    void **slot = (void**)fn_array_addr_with_size(arr, (uint32_t)sizeof(void*),
-                                                  (uint32_t)idx);
-    return slot ? *slot : NULL;
-}
-
-// 判断 il2cpp 对象是否“看起来有效”。用于过滤 Unity Fake Null：对象指针非 0，
-// 但内部已标记为 destroyed/invalid，继续调用 get_transform 可能让 Unity 抛异常/野指针。
-static BOOL CFTObjectLooksValid(Il2CppObject *obj) {
-    if (!obj) return NO;
-    // Unity 对象的 fake null 标记位于指针自身（而非解引用后），直接读指针值即可。
-    // 保守检查：指针为 0 或看起来是未对齐的哨兵值都返回 NO；
-    // 无法确定时交给 CFTInvokeSafe 的 @try/@catch 兜底。
-    uintptr_t v = (uintptr_t)obj;
-    if (v == 0) return NO;
-    // Unity 的 kInvalidObject 通常为 0 或 0x7FFFFFFF；
-    // 某些版本会用哨兵值（如 0xFFFFFFFFFFFFFFFF）表示 invalid。
-    if (v == 0x7FFFFFFFUL || v == 0xFFFFFFFFFFFFFFFFUL) return NO;
-    // 正常对象指针在 iOS 上不会恰好是 1（小整数）；
-    // 如果 il2cpp 数组里塞了哨兵值（如 1 或 -1），直接过滤。
-    if (v <= 4 || (v > (uintptr_t)4 && v < 0x1000)) return NO;
-    return YES;
-}
-
-// 带保护地调用 Unity 方法：il2cpp_runtime_invoke 可能抛出 .NET 异常（Unity Object 为
-// fake null、已销毁、类型不匹配等），必须 @try/@catch 包裹，否则后台线程崩进程。
-static Il2CppObject* CFTInvokeSafe(const MethodInfo *m, void *obj, void **params, const char *label) {
-    @try {
-        return CFTInvoke(m, obj, params);
-    } @catch (NSException *e) {
-        CFTLog(@"invoke 捕获异常 %@ (%s)", e.name, label);
-        return NULL;
+    if (!arr) return NULL;
+    if (fn_array_addr_with_size) {
+        void **slot = (void**)fn_array_addr_with_size(arr, (uint32_t)sizeof(void*),
+                                                      (uint32_t)idx);
+        return slot ? *slot : NULL;
     }
+    return ((Il2CppObject**)((char*)arr + 0x20))[idx];
 }
 
 #pragma mark - 初始化
@@ -395,7 +350,6 @@ static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt,
         void *p0 = typeObj;
         arrObj = CFTInvoke(gFindObjectsOfType, NULL, &p0);
     } else if (gFindObjectsByType) {
-        // 新 Unity：FindObjectsByType(Type, FindObjectsSortMode)，sortMode=None(0)
         void *p0 = typeObj;
         int32_t mode = 0;
         void *params[2] = { &p0, &mode };
@@ -411,10 +365,6 @@ static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt,
     Il2CppArray *arr = (Il2CppArray*)arrObj;
     int32_t n = fn_array_length ? fn_array_length(arr) : 0;
     CFTLog(@"扫描 %@ 命中 %d 个", tt.fullName, n);
-    if (!fn_array_addr_with_size) {
-        CFTLog(@"缺少 il2cpp_array_addr_with_size，无法安全读取数组元素，本轮返回空结果");
-        return items;
-    }
 
     CFTGetCamera();
     Il2CppObject *cam = gMainCamera;
@@ -434,16 +384,14 @@ static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt,
 
     for (int32_t i = 0; i < n; i++) {
         Il2CppObject *elem = CFTArrayElem(arr, i);
-        if (!elem || !CFTObjectLooksValid(elem)) continue;
+        if (!elem) continue;
 
         Il2CppObject *transform = NULL;
         struct CFT_Vec3 wpos = {0,0,0};
 
-        // Unity 对象可能已销毁（fake null）或类型不匹配，调用 get_transform 会抛
-        // .NET 异常，后台线程未捕获会直接崩进程，逐个包裹。
-        transform = CFTInvokeSafe(gGetTransform, elem, NULL, "get_transform");
+        if (gGetTransform) transform = CFTInvoke(gGetTransform, elem, NULL);
         if (transform && gGetPosition && fn_object_unbox) {
-            Il2CppObject *pb = CFTInvokeSafe(gGetPosition, transform, NULL, "get_position");
+            Il2CppObject *pb = CFTInvoke(gGetPosition, transform, NULL);
             if (pb) {
                 struct CFT_Vec3 *p = (struct CFT_Vec3*)fn_object_unbox(pb);
                 if (p) wpos = *p;
@@ -460,7 +408,7 @@ static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt,
         if (cam && gWorldToScreenPoint && fn_object_unbox) {
             struct CFT_Vec3 arg = wpos;
             void *argp = &arg;
-            Il2CppObject *sb = CFTInvokeSafe(gWorldToScreenPoint, cam, &argp, "WorldToScreenPoint");
+            Il2CppObject *sb = CFTInvoke(gWorldToScreenPoint, cam, &argp);
             if (sb) {
                 struct CFT_Vec3 *sp = (struct CFT_Vec3*)fn_object_unbox(sb);
                 if (sp) {
@@ -478,7 +426,7 @@ static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt,
         item.point = pt;
         item.valid = valid;
         item.distance = dist;
-        // 武器/物品类目标不显示“物品 1/物品 2”，有具体名称才分类显示，否则统一显示“武器”。
+
         if ([tt.fullName hasPrefix:@"UnityEngine."] || [tt.comment hasPrefix:@"物品"]) {
             item.label = @"武器";
         } else {
@@ -491,8 +439,6 @@ static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt,
 
 #pragma mark - 窗口构造（scene 感知，保证触摸投递稳定）
 
-// iOS 13+ scene 应用：window 必须挂到活跃的 UIWindowScene，否则虽然能显示，
-// 触摸投递会不稳定（表现为只有个别控件能点、其他区域穿透到游戏）。
 static UIWindowScene* CFTActiveWindowScene(void) {
     UIWindowScene *fallback = nil;
     for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
@@ -504,28 +450,25 @@ static UIWindowScene* CFTActiveWindowScene(void) {
     return fallback;
 }
 
-// 触摸接收窗口：整块矩形都是命中区，点空白不穿透到下层游戏窗口。
 @interface CFTTouchWindow : UIWindow
 @end
 
 @implementation CFTTouchWindow
 
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    return CGRectContainsPoint(self.bounds, point);   // 窗口外必须 NO，避免吞全屏
+    return CGRectContainsPoint(self.bounds, point);
 }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     if (!self.isUserInteractionEnabled || self.isHidden) return nil;
-    if (!CGRectContainsPoint(self.bounds, point)) return nil;   // 窗口外穿透给下层
+    if (!CGRectContainsPoint(self.bounds, point)) return nil;
     UIView *hit = [super hitTest:point withEvent:event];
     if (hit) return hit;
-    // 窗口内空白区域回落到 rootViewController.view（面板自身），不让事件漏给游戏
     return self.rootViewController.view;
 }
 
 @end
 
-// 纯绘制窗口：完全不参与触摸，命中直接返回 nil，事件穿透给下面的窗口。
 @interface CFTPaintOnlyWindow : UIWindow
 @end
 
@@ -537,7 +480,6 @@ static UIWindowScene* CFTActiveWindowScene(void) {
 
 @end
 
-// 悬浮球专用窗口：只在“球圆范围”内命中；圆外/窗口外全部穿透，避免吞全屏触摸。
 @interface CFTBallWindow : UIWindow
 @end
 
@@ -547,7 +489,6 @@ static UIWindowScene* CFTActiveWindowScene(void) {
     if (!CGRectContainsPoint(self.bounds, point)) return NO;
     CGFloat cx = self.bounds.size.width / 2.0;
     CGFloat cy = self.bounds.size.height / 2.0;
-    // 半径 28 + 2pt 容差，保证边缘可点；圆外不命中
     return hypot(point.x - cx, point.y - cy) <= 30.0;
 }
 
@@ -560,8 +501,6 @@ static UIWindowScene* CFTActiveWindowScene(void) {
 
 @end
 
-// 构造触摸窗口：尝试绑定活跃 scene，失败则回退 initWithFrame。
-// window 初始 hidden=NO，确保注册进 UIApplication.windows 事件链。
 static UIWindow* CFTMakeTouchWindow(CGRect frame, UIWindowLevel level) {
     UIWindow *w = nil;
     UIWindowScene *ws = CFTActiveWindowScene();
@@ -571,7 +510,7 @@ static UIWindow* CFTMakeTouchWindow(CGRect frame, UIWindowLevel level) {
     w.windowLevel = level;
     w.backgroundColor = UIColor.clearColor;
     w.userInteractionEnabled = YES;
-    w.hidden = NO;   // 立即可见，注册进事件链
+    w.hidden = NO;
     CFTLog(@"建立触摸窗口 frame=%@ level=%.0f scene=%@",
            NSStringFromCGRect(frame), (double)level, ws ? @"已绑定" : @"无(回退)");
     return w;
@@ -582,6 +521,20 @@ static UIWindow* CFTMakeTouchWindow(CGRect frame, UIWindowLevel level) {
 @class CFTOverlayView;
 static UIWindow *gOverlayWindow;
 static CFTOverlayView *gOverlayView;
+
+/// 判断当前是否在主线程
+static inline BOOL CFTIsMainThread(void) {
+    return [NSThread isMainThread];
+}
+
+/// 仅在主线程执行 block；非主线程则 dispatch_sync 到主线程
+static void CFTRunOnMainSync(void (^block)(void)) {
+    if (CFTIsMainThread()) {
+        block();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), block);
+    }
+}
 
 @interface CFTOverlayView : UIView
 @property(nonatomic, strong) NSArray<CFTItem*> *items;
@@ -605,7 +558,7 @@ static CFTOverlayView *gOverlayView;
 }
 
 - (void)drawRect:(CGRect)rect {
-    if (!gDrawEnabled) return;   // 总开关关：什么都不画
+    if (!gDrawEnabled) return;
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (!ctx) return;
 
@@ -650,36 +603,34 @@ static CFTOverlayView *gOverlayView;
 @end
 
 static void CFTSetupOverlay(void) {
-    // 创建 UIWindow/UIView/UIViewController 必须主线程；后台线程直接构造会
-    // 造成不可恢复的 UIKit 状态错乱，表现为偶发 EXC_BAD_ACCESS。
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            CFTSetupOverlay();
-        });
-        return;
-    }
     if (gOverlayWindow) return;
-    gOverlayWindow = [[CFTPaintOnlyWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    // ▼ 修复：iOS 13+ 优先绑定 UIWindowScene，避免无 scene 导致崩溃
+    UIWindowScene *ws = CFTActiveWindowScene();
+    if (ws) {
+        gOverlayWindow = [[CFTPaintOnlyWindow alloc] initWithWindowScene:ws];
+    } else {
+        gOverlayWindow = [[CFTPaintOnlyWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    }
+    gOverlayWindow.frame = UIScreen.mainScreen.bounds;
     gOverlayWindow.windowLevel = UIWindowLevelStatusBar + 300;
     gOverlayWindow.userInteractionEnabled = NO;
     gOverlayView = [[CFTOverlayView alloc] initWithFrame:gOverlayWindow.bounds];
     gOverlayWindow.rootViewController = [UIViewController new];
     [gOverlayWindow.rootViewController.view addSubview:gOverlayView];
     gOverlayWindow.hidden = !gDrawEnabled;
+    CFTLog(@"叠加窗口已建立 frame=%@ scene=%@", NSStringFromCGRect(gOverlayWindow.frame), ws ? @"已绑定" : @"无(回退)");
 }
 
 static CFTSwitch *gSwDraw;
-static BOOL gSwDrawWasOn = NO;   // 用户是否曾打开总绘制，未选类时只记录意图，不启动扫描
+static BOOL gSwDrawWasOn = NO;
 static void CFTUpdateSubSwitches(void);
 
 #pragma mark - 扫描定时
 
 static NSTimer *gScanTimer;
-static void CFTCleanupDrawState(void);   // 前向声明，供 onMinimize 等 UI 回调使用
+static void CFTCleanupDrawState(void);
 
 static void CFTRefreshScan(void) {
-    // CFTRefreshScan 本身可在后台扫描线程执行：只读 Unity 对象并构建 items；
-    // 但凡创建/修改 UIKit Overlay，都必须统一派发到主线程，避免后台创建 UIWindow 导致闪退。
     os_unfair_lock_lock(&gScanLock);
     if (!gReady || !gDrawEnabled || !gCurrentClassName || gScanInProgress) {
         os_unfair_lock_unlock(&gScanLock);
@@ -693,11 +644,10 @@ static void CFTRefreshScan(void) {
         if ([t.fullName isEqualToString:gCurrentClassName]) { tt = t; break; }
     }
     if (!tt) {
-        gScanInProgress = NO;
         os_unfair_lock_unlock(&gScanLock);
         return;
     }
-    Il2CppClass *cls = CFTFindGameClass(tt);   // 每轮重新获取类
+    Il2CppClass *cls = CFTFindGameClass(tt);
     if (!cls) {
         gScanInProgress = NO;
         os_unfair_lock_unlock(&gScanLock);
@@ -719,10 +669,7 @@ static void CFTRefreshScan(void) {
     NSArray<CFTItem*> *items = CFTBuildItems(cls, tt, (NSInteger)idx);
     gScanInProgress = NO;
     os_unfair_lock_unlock(&gScanLock);
-    // 结果写回 UI 必须回主线程：gOverlayWindow / gOverlayView 是 UIKit 对象，后台线程直接 setNeedsDisplay / items 会崩。
     dispatch_async(dispatch_get_main_queue(), ^{
-        // 后台扫描期间用户可能已关总开关或切换类：只在状态一致时把结果写回 UI，
-        // 避免把旧 overlay / 旧类 items 刷回已清理的主线程造成野指针闪退。
         os_unfair_lock_lock(&gScanLock);
         BOOL stillEnabled = gDrawEnabled;
         BOOL sameClass = (gCurrentClassName && [gCurrentClassName isEqualToString:tt.fullName]);
@@ -749,7 +696,6 @@ static void CFTStopScanTimer(void) {
 }
 
 static void CFTStartScanTimer(void) {
-    // 只在主线程创建 NSTimer；后台线程启定时器是二开闪退的主因之一。
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{
             CFTStartScanTimer();
@@ -769,18 +715,16 @@ static void CFTStartScanTimer(void) {
         CFTLog(@"扫描定时器未启动：drawOn=%d class=%@", drawOn, curCls);
         return;
     }
+    // ▼ 修复：il2cpp API（尤其 il2cpp_runtime_invoke）必须在主线程调用，
+    //   不可 dispatch 到后台队列，否则立即闪退。
     gScanTimer = [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES
                                                  block:^(NSTimer *t) {
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            CFTAttach();                         // GCD 线程每次必须 attach
-            CFTRefreshScan();
-        });
+        CFTAttach();
+        CFTRefreshScan();
     }];
-    CFTLog(@"扫描定时器已启动");
+    CFTLog(@"扫描定时器已启动（主线程模式）");
 }
 
-// 公共清理函数：停定时器、关总绘制、清屏幕 items。切类名/关开关/最小化时都应调用，
-// 避免旧定时器继续轮询旧类名导致的野指针闪退。
 static void CFTCleanupDrawState(void) {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -803,8 +747,8 @@ static void CFTCleanupDrawState(void) {
 static void CFTSelectTarget(CFTTarget *tt) {
     CFTAttach();
     CFTInit();
-    CFTGetCamera();                              // 点类名同时自动重新获取摄像机
-    // 先停旧定时器并复位绘制状态，再切换类名，避免旧类名定时器在窗口期继续运行。
+    CFTGetCamera();
+
     CFTCleanupDrawState();
     os_unfair_lock_lock(&gScanLock);
     gDrawEnabled = NO;
@@ -813,13 +757,9 @@ static void CFTSelectTarget(CFTTarget *tt) {
     gCurrentComment = [tt.comment copy];
     os_unfair_lock_unlock(&gScanLock);
 
-    Il2CppClass *cls = CFTFindGameClass(tt);     // 自动获取类与对象校验
+    Il2CppClass *cls = CFTFindGameClass(tt);
     CFTLog(@"选择类 %@（%@）类=%@ 摄像机=%p",
            tt.fullName, tt.comment, cls ? @"已获取" : @"未找到", gMainCamera);
-
-    // 注意：这里不自动恢复 Overlay/扫描。切类先做 cleanup，把旧定时器、旧 overlay 数据、
-    // gDrawEnabled 全部复位；用户再手动打开总绘制时，gSwDraw.changed 会在已选新类的状态下
-    // 安全启动扫描。避免“用户已关总绘制”或“切类窗口期”里旧扫描线程继续写回旧类结果。
 }
 
 #pragma mark - 矩形开关（安卓风格，非系统 UISwitch）
@@ -867,15 +807,11 @@ static void CFTSelectTarget(CFTTarget *tt) {
     if (self.changed) self.changed(_on);
 }
 
-// 扩大可点击区域：整个开关行都算命中，降低断触概率。
-// pointInside 使用自身坐标系：外扩 10pt 命中区（左右各 10，上下各 10）。
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
     CGRect hit = CGRectInset(self.bounds, -10, -10);
     return CGRectContainsPoint(hit, point);
 }
 
-// hitTest 统一走父级转换后的本地坐标，命中开关本体或外扩区都返回 self，
-// 避免边缘触摸漏给父级导致断触/按钮误触。
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     CGPoint local = [self convertPoint:point toView:self];
     if (![self pointInside:local withEvent:event]) return nil;
@@ -892,19 +828,16 @@ static void CFTSelectTarget(CFTTarget *tt) {
 @implementation CFTPanelView
 
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    return YES;   // 整个面板区域（含空白/内边距）都算命中，一律不穿透
+    return YES;
 }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    // 子视图优先：按钮/开关/ScrollView 自己处理触摸和手势；
-    // 只有空白区域才交给面板吞掉，防止穿透到游戏，同时保留 UIScrollView 滚动能力。
     if (!CGRectContainsPoint(self.bounds, point)) return nil;
     UIView *hit = [super hitTest:point withEvent:event];
     if (hit) return hit;
     return self;
 }
 
-// 兜底：空白处的触摸由面板吞掉，不落到游戏视图；滚动区会命中 UIScrollView，因此仍允许其处理拖动。
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {}
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {}
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {}
@@ -928,7 +861,6 @@ static CFTSwitch *gSwRay;
 @end
 @implementation CFTMenuController
 
-// 拖动只从“非控件区域”开始：点在按钮/开关上时让控件自己处理，点击不会被拖动吃掉。
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gr shouldReceiveTouch:(UITouch *)touch {
     UIView *v = touch.view;
     while (v && v != gPanel) {
@@ -954,7 +886,7 @@ static CFTSwitch *gSwRay;
 
 - (void)onMinimize {
     gMenuWindow.hidden = YES;
-    CFTCleanupDrawState();   // 最小化时暂停扫描并清屏
+    CFTCleanupDrawState();
     CFTLog(@"菜单最小化，扫描已暂停");
 }
 
@@ -1008,17 +940,15 @@ static void CFTUpdateSubSwitches(void) {
 static void CFTMenuBuild(void) {
     if (gMenuWindow) return;
 
-    // 内容可滚动，避免在小屏上被截断；窗口高度按屏幕可用高度自适应，滚动区视口小于内容高度 500pt。
     CGFloat screenH = UIScreen.mainScreen.bounds.size.height;
     const CGFloat H = MIN(460.0, MAX(320.0, screenH - 160.0));
-    const CGFloat W = 285, scrollH = H - 36;   // 36 是标题栏高度
-    const CGFloat contentH = 500;             // 内容实际高度，大于滚动视口才出现滚动条
+    const CGFloat W = 285, scrollH = H - 36;
+    const CGFloat contentH = 500;
     CGRect defaultFrame = CGRectMake(35, MAX(20.0, (screenH - H) / 2.0), W, H);
 
-    // 面板窗口层级高于悬浮球窗口，避免面板被小球窗口压住
     gMenuWindow = CFTMakeTouchWindow(defaultFrame, UIWindowLevelStatusBar + 450);
     gMenuWindow.exclusiveTouch = YES;
-    gMenuWindow.hidden = YES;   // 面板先建好，由 CFTMenuShow 再显示
+    gMenuWindow.hidden = YES;
 
     gPanel = [[CFTPanelView alloc] initWithFrame:CGRectMake(0, 0, W, H)];
     gPanel.backgroundColor = kCFTBg;
@@ -1027,7 +957,6 @@ static void CFTMenuBuild(void) {
     gPanel.layer.borderColor = kCFTLine.CGColor;
     gPanel.clipsToBounds = YES;
 
-    // 标题栏（含最小化按钮）
     UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, W, 36)];
     bar.backgroundColor = kCFTBar;
     UILabel *title = CFTMakeLabel(CGRectMake(12, 0, 200, 36),
@@ -1047,15 +976,13 @@ static void CFTMenuBuild(void) {
 
     [gPanel addSubview:bar];
 
-    // 面板拖动只挂标题栏，避免整块 panel 的 UIPanGestureRecognizer 吞掉 UIScrollView 手势。
     UIPanGestureRecognizer *mp = [[UIPanGestureRecognizer alloc]
         initWithTarget:gMenuController action:@selector(onMenuPan:)];
-    mp.cancelsTouchesInView = NO;   // 不取消按钮/开关的点击
+    mp.cancelsTouchesInView = NO;
     mp.delaysTouchesBegan = NO;
     mp.maximumNumberOfTouches = 1;
     [bar addGestureRecognizer:mp];
 
-    // 滚动区：从标题栏下方开始，可上下滚动查看完整功能。
     UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 36, W, scrollH)];
     scroll.backgroundColor = kCFTBg;
     scroll.showsVerticalScrollIndicator = YES;
@@ -1074,7 +1001,6 @@ static void CFTMenuBuild(void) {
            NSStringFromCGRect(scroll.bounds),
            contentH, scrollH);
 
-    // 分组：目标类（相对滚动内容，y 从 0 开始）
     [content addSubview:CFTMakeLabel(CGRectMake(12, 8, 200, 12),
                                      @"目标类（点击自动获取）", kCFTSUB,
                                      UIFontWeightRegular, 11)];
@@ -1096,14 +1022,12 @@ static void CFTMenuBuild(void) {
         [gClassButtons addObject:b];
     }
 
-    // 摄像机（滚动内容内 y=170）
     UIButton *camBtn = CFTMakeRectButton(CGRectMake(12, 170, W - 24, 30),
                                          @"重新获取摄像机");
     [camBtn addTarget:camBtn action:@selector(cft_cameraTapped)
                  forControlEvents:UIControlEventTouchUpInside];
     [content addSubview:camBtn];
 
-    // 分隔（滚动内容内 y=210）
     UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(12, 210, W - 24, 1)];
     sep.backgroundColor = kCFTLine;
     [content addSubview:sep];
@@ -1112,7 +1036,6 @@ static void CFTMenuBuild(void) {
                                      @"绘制", kCFTSUB,
                                      UIFontWeightRegular, 11)];
 
-    // 开关行
     NSArray *rows = @[
         @[@"绘制总开关", @"draw"],
         @[@"方框", @"box"],
@@ -1122,7 +1045,7 @@ static void CFTMenuBuild(void) {
     ];
     NSMutableArray *sws = [NSMutableArray array];
     for (NSUInteger i = 0; i < rows.count; i++) {
-        CGFloat y = 236 + i * 28;   // 开关行在滚动内容内，保证底部完整可见
+        CGFloat y = 236 + i * 28;
         [content addSubview:CFTMakeLabel(CGRectMake(12, y, 160, 24),
                                          rows[i][0], kCFTText,
                                          UIFontWeightRegular, 12)];
@@ -1139,20 +1062,15 @@ static void CFTMenuBuild(void) {
     gSwDist.on = gShowDistance; gSwRay.on = gShowRay;
 
     gSwDraw.changed = ^(BOOL on) {
-        // 主线程改全局状态时持锁，避免后台扫描线程同时读到半更新状态导致闪退。
-        // 未选目标类时不置 gDrawEnabled：避免后续 CFTRefreshScan 因 gCurrentClassName 为空而提前返回；
-        // 但 UI 保持“已开”态，记录用户意图（gSwDrawWasOn），选类后由 CFTSelectTarget 恢复扫描。
         gSwDrawWasOn = on;
         os_unfair_lock_lock(&gScanLock);
-        BOOL hasClass = gCurrentClassName.length > 0;
-        gDrawEnabled = (on && hasClass) ? YES : NO;
+        BOOL canScan = on && gCurrentClassName.length > 0;
+        gDrawEnabled = canScan;
         os_unfair_lock_unlock(&gScanLock);
         if (on) {
-            // 所有 UIKit 操作统一回主线程；未选目标类时不创建 Overlay、不启动扫描，避免空指针。
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (!gCurrentClassName) {
                     CFTLog(@"绘制总开关已开，但未选择目标类；先选类后再开启扫描");
-                    // gDrawEnabled 保持 NO（见上方），避免 CFTRefreshScan 因 !gCurrentClassName 提前返回导致扫描器不启动
                     CFTUpdateSubSwitches();
                     return;
                 }
@@ -1164,29 +1082,29 @@ static void CFTMenuBuild(void) {
                 if (gSwDraw) gSwDraw.on = YES;
             });
         } else {
-            CFTCleanupDrawState();              // 关绘制时停扫描并清屏，释放资源
+            CFTCleanupDrawState();
         }
         CFTUpdateSubSwitches();
         CFTLog(@"绘制总开关 → %@", on ? @"开" : @"关");
     };
     gSwBox.changed = ^(BOOL on) {
         gShowBox = on;
-        if (gOverlayWindow && gOverlayView) [gOverlayView setNeedsDisplay];
+        if (gOverlayView) [gOverlayView setNeedsDisplay];
         CFTLog(@"开关 方框 → %@", on ? @"开" : @"关");
     };
     gSwName.changed = ^(BOOL on) {
         gShowName = on;
-        if (gOverlayWindow && gOverlayView) [gOverlayView setNeedsDisplay];
+        if (gOverlayView) [gOverlayView setNeedsDisplay];
         CFTLog(@"开关 名字 → %@", on ? @"开" : @"关");
     };
     gSwDist.changed = ^(BOOL on) {
         gShowDistance = on;
-        if (gOverlayWindow && gOverlayView) [gOverlayView setNeedsDisplay];
+        if (gOverlayView) [gOverlayView setNeedsDisplay];
         CFTLog(@"开关 距离 → %@", on ? @"开" : @"关");
     };
     gSwRay.changed = ^(BOOL on) {
         gShowRay = on;
-        if (gOverlayWindow && gOverlayView) [gOverlayView setNeedsDisplay];
+        if (gOverlayView) [gOverlayView setNeedsDisplay];
         CFTLog(@"开关 射线 → %@", on ? @"开" : @"关");
     };
 
@@ -1200,7 +1118,6 @@ static void CFTMenuBuild(void) {
            NSStringFromCGSize(gPanel.frame.size), gPanel.isUserInteractionEnabled ? @"是" : @"否");
 }
 
-// 按钮事件（挂到 UIButton 上，需在类层级可见）
 @interface UIButton (CFTHandlers)
 - (void)cft_classTapped:(UIButton*)sender;
 - (void)cft_cameraTapped;
@@ -1211,29 +1128,25 @@ static void CFTMenuBuild(void) {
     if ((NSUInteger)sender.tag >= targets.count) return;
     CFTTarget *tt = (CFTTarget*)targets[sender.tag];
     CFTLog(@"点击类名按钮：%@（%@）", tt.comment, tt.fullName);
-    // 切类前先清理 UI/定时器/绘制状态，避免旧定时器在后台继续跑旧类名。
+
     CFTCleanupDrawState();
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        CFTAttach();
-        CFTSelectTarget(tt);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            CFTUpdateClassButtonStyles();
-        });
-    });
+    // ▼ 修复：il2cpp invoke（CFTSelectTarget → CFTGetCamera）必须在主线程
+    CFTAttach();
+    CFTSelectTarget(tt);
+    CFTUpdateClassButtonStyles();
 }
 - (void)cft_cameraTapped {
     CFTLog(@"点击按钮：重新获取摄像机");
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        CFTAttach();
-        CFTInit();
-        CFTGetCamera();
-    });
+    // ▼ 修复：il2cpp invoke 必须在主线程
+    CFTAttach();
+    CFTInit();
+    CFTGetCamera();
 }
 @end
 
 static void CFTMenuShow(void) {
     CFTMenuBuild();
-    // 若 frame 超出屏幕（拖动过/旋转），回到默认位置
+
     CGRect f = gMenuWindow.frame;
     CGRect sb = UIScreen.mainScreen.bounds;
     if (f.origin.x < 0 || f.origin.y < 0 ||
@@ -1256,7 +1169,7 @@ static UIView *gBtn;
 - (void)onTap;
 - (void)onPan:(UIPanGestureRecognizer*)gr;
 @end
-static CFTController *gBtnCtl;   // 保留引用避免被释放（tap/pan target）
+static CFTController *gBtnCtl;
 @implementation CFTController
 
 - (void)onTap {
@@ -1284,14 +1197,9 @@ static CFTController *gBtnCtl;   // 保留引用避免被释放（tap/pan target
 }
 @end
 
-// 悬浮球用独立 CFTTouchWindow（复用已有类），脱离游戏 window 的 subview 树，
-// 事件链独立，Unity 抢不走触摸。球视图占满整个窗口，点/拖均落在球上。
 static void CFTSetupButton(void) {
     if (gBtnWindow) return;
 
-    // 球窗口必须走 scene 构造（iOS 13+ Scene 架构下 initWithFrame: 不渲染到屏）。
-    // 拿不到活跃 scene 时（constructor 跑得太早，scene 还没激活）就 200ms 后重试，
-    // 绝不回退到 initWithFrame:，否则窗口静默失败。
     UIWindowScene *ws = CFTActiveWindowScene();
     if (!ws) {
         CFTLog(@"悬浮球：未取到活跃 UIWindowScene，200ms 后重试（不建 window）");
@@ -1322,7 +1230,7 @@ static void CFTSetupButton(void) {
 
     UILabel *lab = [[UILabel alloc] initWithFrame:gBtn.bounds];
     lab.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    lab.userInteractionEnabled = NO;   // 不让 label 拦截手势，tap/pan 由 gBtn 上的 recognizer 处理
+    lab.userInteractionEnabled = NO;
     lab.text = @"CF";
     lab.textColor = kCFTAccent;
     lab.font = [UIFont systemFontOfSize:18 weight:UIFontWeightBold];
@@ -1342,7 +1250,6 @@ static void CFTSetupButton(void) {
     gBtnWindow.rootViewController = vc;
     gBtnWindow.hidden = NO;
 
-    // rootVC 装载后 vc.view.frame 可能被重置，手动对齐一次确保球可见
     gBtn.frame = gBtnWindow.bounds;
 
     CFTLog(@"悬浮球独立窗口已建立 frame=%@ level=%.0f vcViewFrame=%@",
