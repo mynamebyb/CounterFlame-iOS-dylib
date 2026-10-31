@@ -6,6 +6,8 @@
 #import <math.h>
 #import <string.h>
 #import <os/lock.h>
+#import <signal.h>
+#import <execinfo.h>
 
 #pragma mark - il2cpp 类型
 
@@ -63,13 +65,68 @@ static UIColor* CFTHex(unsigned int rgb, CGFloat a) {
 #define kCFTAccent  CFTHex(0x3B9DFF, 1.0)   // ▼ 主题蓝
 #define kCFTOff     CFTHex(0x262B33, 1.0)
 
-#pragma mark - 日志（仅控制台，不写文件）
+#pragma mark - 日志（控制台 + Documents/counterflame_crash.log）
+
+static NSString* CFTLogPath(void) {
+    static NSString *p;
+    static dispatch_once_t t;
+    dispatch_once(&t, ^{
+        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                              NSUserDomainMask, YES).firstObject;
+        p = [docs stringByAppendingPathComponent:@"counterflame_crash.log"];
+        if (![[NSFileManager defaultManager] fileExistsAtPath:p]) {
+            [@"" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+    });
+    return p;
+}
+
+static void CFTWriteLog(NSString *msg) {
+    @try {
+        NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:CFTLogPath()];
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        }
+    } @catch (__unused NSException *e) {}
+}
 
 static void CFTLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     NSLog(@"[CounterFlameTool] %@", msg);
+    CFTWriteLog(msg);
+}
+
+// 信号崩溃处理器：捕获 SIGSEGV/SIGBUS 并写崩溃日志
+static void CFTCrashHandler(int sig) {
+    const char *signame = "UNKNOWN";
+    switch (sig) {
+        case SIGSEGV: signame = "SIGSEGV"; break;
+        case SIGBUS:  signame = "SIGBUS"; break;
+        case SIGABRT: signame = "SIGABRT"; break;
+    }
+    
+    void *stack[64];
+    int frames = backtrace(stack, 64);
+    char **symbols = backtrace_symbols(stack, frames);
+    
+    NSString *crash = [NSString stringWithFormat:@"--- CRASH: %s ---\n", signame];
+    for (int i = 0; i < frames; i++) {
+        crash = [crash stringByAppendingFormat:@"%d: %s\n", i, symbols[i]];
+    }
+    
+    CFTWriteLog(crash);
+    _exit(1);
+}
+
+static void CFTInstallCrashHandler(void) {
+    signal(SIGSEGV, CFTCrashHandler);
+    signal(SIGBUS,  CFTCrashHandler);
+    signal(SIGABRT, CFTCrashHandler);
 }
 
 #pragma mark - 全局状态（绘制默认全关）
@@ -233,6 +290,26 @@ static Il2CppObject* CFTArrayElem(Il2CppArray *arr, int32_t idx) {
     return ((Il2CppObject**)((char*)arr + 0x20))[idx];
 }
 
+// ▼ 指针有效性校验：检查指针是否在合法地址范围内
+//   il2cpp 对象前 8 字节是 vtable/lockword，class 指针在第 0 字节偏移
+static BOOL CFTValidPtr(void *ptr) {
+    if (!ptr) return NO;
+    uintptr_t addr = (uintptr_t)ptr;
+    // iOS arm64 用户空间地址范围：0x100000000 ~ 0x200000000（约 4GB）
+    // 低于 0x1000 或高于 0x7FFFFFFFFFFF 大概率是野指针
+    if (addr < 0x1000) return NO;
+    if (addr > 0x7FFFFFFFFFFF) return NO;
+    return YES;
+}
+
+// ▼ 校验 il2cpp 托管对象：检查前 8 字节（klass 指针）是否合法
+static BOOL CFTValidObject(Il2CppObject *obj) {
+    if (!CFTValidPtr(obj)) return NO;
+    // 读取 klass 指针（对象头第 0 字节）
+    void *klass = *(void**)obj;
+    return CFTValidPtr(klass);
+}
+
 #pragma mark - 初始化
 
 static void CFTResolve(void* *ptr, const char *name) {
@@ -310,7 +387,13 @@ static void CFTInit(void) {
 
 static void CFTGetCamera(void) {
     if (!gReady || !gCameraGetMain) return;
-    gMainCamera = CFTInvoke(gCameraGetMain, NULL, NULL);
+    Il2CppObject *cam = CFTInvoke(gCameraGetMain, NULL, NULL);
+    if (cam && CFTValidObject(cam)) {
+        gMainCamera = cam;
+    } else {
+        CFTLog(@"GetCamera: 返回无效对象 %p", cam);
+        gMainCamera = nil;
+    }
 }
 
 #pragma mark - ESP 元素
@@ -325,48 +408,92 @@ static void CFTGetCamera(void) {
 
 static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt, NSInteger index) {
     NSMutableArray *items = [NSMutableArray array];
-    if (!gReady || !targetClass) return items;
+    if (!gReady || !targetClass) {
+        CFTLog(@"BuildItems 退出：ready=%d class=%p", gReady, targetClass);
+        return items;
+    }
+
+    CFTLog(@"BuildItems 开始 class=%@ n=...", tt.fullName);
 
     const Il2CppType *type = fn_class_get_type ? fn_class_get_type(targetClass) : NULL;
+    if (!type) {
+        CFTLog(@"BuildItems 退出：class_get_type 返回 NULL");
+        return items;
+    }
+    CFTLog(@"BuildItems type=%p 有效", type);
+
     Il2CppObject *typeObj = CFTTypeObject(type);
-    if (!typeObj) return items;
+    if (!typeObj) {
+        CFTLog(@"BuildItems 退出：CFTTypeObject 返回 NULL");
+        return items;
+    }
+    CFTLog(@"BuildItems typeObj=%p 有效", typeObj);
+
+    // ▼ 校验 typeObj 的托管对象头
+    if (!CFTValidObject(typeObj)) {
+        CFTLog(@"BuildItems 退出：typeObj 对象头无效 addr=%p", typeObj);
+        return items;
+    }
 
     Il2CppObject *arrObj = NULL;
     if (gFindObjectsOfType) {
         void *p0 = typeObj;
+        CFTLog(@"BuildItems 调用 FindObjectsOfType...");
         arrObj = CFTInvoke(gFindObjectsOfType, NULL, &p0);
+        CFTLog(@"BuildItems FindObjectsOfType 返回 %p", arrObj);
     } else if (gFindObjectsByType) {
         void *p0 = typeObj;
         int32_t mode = 0;
         void *params[2] = { &p0, &mode };
+        CFTLog(@"BuildItems 调用 FindObjectsByType...");
         arrObj = CFTInvoke(gFindObjectsByType, NULL, params);
+        CFTLog(@"BuildItems FindObjectsByType 返回 %p", arrObj);
     }
-    if (!arrObj) return items;
-
-    Il2CppArray *arr = (Il2CppArray*)arrObj;
-    int32_t n = fn_array_length ? fn_array_length(arr) : 0;
-
-    // ▼ 修复物品闪退：非法/过大数量直接丢弃，避免野指针遍历
-    if (n < 0 || n > 256) {
-        CFTLog(@"%@ 数组数量异常 n=%d，跳过", tt.fullName, n);
+    if (!arrObj) {
+        CFTLog(@"BuildItems 退出：查找返回 NULL");
         return items;
     }
 
+    // ▼ 校验数组对象头
+    if (!CFTValidObject(arrObj)) {
+        CFTLog(@"BuildItems 退出：数组对象头无效");
+        return items;
+    }
+
+    Il2CppArray *arr = (Il2CppArray*)arrObj;
+    int32_t n = fn_array_length ? fn_array_length(arr) : 0;
+    CFTLog(@"BuildItems 数组长度 n=%d", n);
+
+    if (n < 0 || n > 256) {
+        CFTLog(@"BuildItems 退出：数量异常 n=%d", n);
+        return items;
+    }
+    if (n == 0) return items;
+
     CFTGetCamera();
     Il2CppObject *cam = gMainCamera;
+    CFTLog(@"BuildItems camera=%p", cam);
+
+    // ▼ 校验摄像机对象
+    if (cam && !CFTValidObject(cam)) {
+        CFTLog(@"BuildItems 摄像机对象无效，置空");
+        cam = nil;
+        gMainCamera = nil;
+    }
 
     struct CFT_Vec3 camPos = {0,0,0};
     if (cam && gCameraGetPosition && fn_object_unbox) {
-        @try {
-            Il2CppObject *box = CFTInvoke(gCameraGetPosition, cam, NULL);
-            if (box) {
-                struct CFT_Vec3 *p = (struct CFT_Vec3*)fn_object_unbox(box);
-                if (p) camPos = *p;
+        Il2CppObject *box = CFTInvoke(gCameraGetPosition, cam, NULL);
+        if (box && CFTValidObject(box)) {
+            void *raw = fn_object_unbox(box);
+            if (raw && CFTValidPtr(raw)) {
+                struct CFT_Vec3 *p = (struct CFT_Vec3*)raw;
+                if (isfinite(p->x) && isfinite(p->y) && isfinite(p->z)) {
+                    camPos = *p;
+                }
             }
-        } @catch (NSException *e) {
-            CFTLog(@"获取摄像机位置异常：%@", e.reason);
-            cam = nil;
         }
+        CFTLog(@"BuildItems camPos=(%.1f, %.1f, %.1f)", camPos.x, camPos.y, camPos.z);
     }
 
     CGFloat scale = gScreenScale;
@@ -374,55 +501,68 @@ static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt,
     CGFloat screenW = gScreenW;
     BOOL human = CFTIsHumanTarget(tt);
 
-    // ▼ 物品类对象可能存在已销毁实例（主界面尤其多），对每个对象调用用 @try 兜底
+    int skipped = 0, added = 0;
+
     for (int32_t i = 0; i < n; i++) {
         @autoreleasepool {
-            @try {
-                Il2CppObject *elem = CFTArrayElem(arr, i);
-                if (!elem) continue;
+            Il2CppObject *elem = CFTArrayElem(arr, i);
+            if (!elem || !CFTValidPtr(elem)) { skipped++; continue; }
 
-                // 跳过可能已被 Unity 销毁的对象（野指针）
-                // il2cpp 没有 isAlive 导出，只能通过 fn_object_get_class 间接校验
-                if (fn_object_get_class) {
-                    Il2CppClass *ec = fn_object_get_class(elem);
-                    if (!ec) continue;  // 已销毁对象通常 class 指针为空或无效
-                }
+            // ▼ 校验对象头 klass 指针
+            if (!CFTValidObject(elem)) { skipped++; continue; }
 
-                Il2CppObject *transform = NULL;
-                struct CFT_Vec3 wpos = {0,0,0};
+            // ▼ 用 fn_object_get_class 二次校验
+            if (fn_object_get_class) {
+                Il2CppClass *ec = fn_object_get_class(elem);
+                if (!ec || !CFTValidPtr(ec)) { skipped++; continue; }
+            }
 
-                if (gGetTransform) transform = CFTInvoke(gGetTransform, elem, NULL);
-                if (!transform) continue;   // 对象无效，拿不到 transform
+            // ▼ 获取 transform
+            Il2CppObject *transform = NULL;
+            if (gGetTransform) {
+                transform = CFTInvoke(gGetTransform, elem, NULL);
+            }
+            if (!transform || !CFTValidObject(transform)) { skipped++; continue; }
 
-                if (gGetPosition && fn_object_unbox) {
-                    Il2CppObject *pb = CFTInvoke(gGetPosition, transform, NULL);
-                    if (pb) {
-                        struct CFT_Vec3 *p = (struct CFT_Vec3*)fn_object_unbox(pb);
-                        if (p) wpos = *p;
-                    }
-                }
-                // ▼ 人物 Transform 在脚底，世界坐标抬高半身高，投影随距离自然缩放
-                if (human) wpos.y += kCFTHumanLift;
+            // ▼ 获取世界坐标
+            struct CFT_Vec3 wpos = {0,0,0};
+            if (gGetPosition && fn_object_unbox) {
+                Il2CppObject *pb = CFTInvoke(gGetPosition, transform, NULL);
+                if (pb && CFTValidObject(pb)) {
+                    void *raw = fn_object_unbox(pb);
+                    if (raw && CFTValidPtr(raw)) {
+                        struct CFT_Vec3 *p = (struct CFT_Vec3*)raw;
+                        if (isfinite(p->x) && isfinite(p->y) && isfinite(p->z)) {
+                            wpos = *p;
+                        } else {
+                            skipped++; continue;
+                        }
+                    } else { skipped++; continue; }
+                } else { skipped++; continue; }
+            }
 
-                // 坐标合理性检查：距离超大或 NaN 说明数据异常
-                if (!isfinite(wpos.x) || !isfinite(wpos.y) || !isfinite(wpos.z)) continue;
-                if (fabsf(wpos.x) > 10000 || fabsf(wpos.y) > 10000 || fabsf(wpos.z) > 10000) continue;
+            if (human) wpos.y += kCFTHumanLift;
 
-                float dx = wpos.x - camPos.x;
-                float dy = wpos.y - camPos.y;
-                float dz = wpos.z - camPos.z;
-                double dist = sqrt(dx*dx + dy*dy + dz*dz);
+            if (fabsf(wpos.x) > 10000 || fabsf(wpos.y) > 10000 || fabsf(wpos.z) > 10000) {
+                skipped++; continue;
+            }
 
-                CGPoint pt = CGPointZero;
-                BOOL valid = NO;
-                if (cam && gWorldToScreenPoint && fn_object_unbox) {
-                    struct CFT_Vec3 arg = wpos;
-                    void *argp = &arg;
-                    Il2CppObject *sb = CFTInvoke(gWorldToScreenPoint, cam, &argp);
-                    if (sb) {
-                        struct CFT_Vec3 *sp = (struct CFT_Vec3*)fn_object_unbox(sb);
-                        if (sp && isfinite(sp->x) && isfinite(sp->y) && isfinite(sp->z)) {
-                            // ▼ 修复背向误绘：z<=0 表示目标在摄像机背后
+            float dx = wpos.x - camPos.x;
+            float dy = wpos.y - camPos.y;
+            float dz = wpos.z - camPos.z;
+            double dist = sqrt(dx*dx + dy*dy + dz*dz);
+
+            CGPoint pt = CGPointZero;
+            BOOL valid = NO;
+            if (cam && gWorldToScreenPoint && fn_object_unbox) {
+                struct CFT_Vec3 arg = wpos;
+                void *argp = &arg;
+                Il2CppObject *sb = CFTInvoke(gWorldToScreenPoint, cam, &argp);
+                if (sb && CFTValidObject(sb)) {
+                    void *raw = fn_object_unbox(sb);
+                    if (raw && CFTValidPtr(raw)) {
+                        struct CFT_Vec3 *sp = (struct CFT_Vec3*)raw;
+                        if (isfinite(sp->x) && isfinite(sp->y) && isfinite(sp->z)) {
                             if (sp->z > 0.0f) {
                                 CGFloat px = sp->x / scale;
                                 CGFloat py = (screenH * scale - sp->y) / scale;
@@ -434,23 +574,22 @@ static NSArray<CFTItem*>* CFTBuildItems(Il2CppClass *targetClass, CFTTarget *tt,
                         }
                     }
                 }
-
-                CFTItem *item = [CFTItem new];
-                item.point = pt;
-                item.valid = valid;
-                item.distance = dist;
-                if (human) {
-                    item.label = [NSString stringWithFormat:@"%@ #%ld", tt.comment, (long)(index + 1)];
-                } else {
-                    item.label = @"物品";
-                }
-                [items addObject:item];
-            } @catch (NSException *e) {
-                // 单个对象异常不影响整体，跳过继续
-                continue;
             }
+
+            CFTItem *item = [CFTItem new];
+            item.point = pt;
+            item.valid = valid;
+            item.distance = dist;
+            if (human) {
+                item.label = [NSString stringWithFormat:@"%@ #%ld", tt.comment, (long)(index + 1)];
+            } else {
+                item.label = @"物品";
+            }
+            [items addObject:item];
+            added++;
         }
     }
+    CFTLog(@"BuildItems 完成：added=%d skipped=%d total=%d", added, skipped, n);
     return items;
 }
 
@@ -1282,6 +1421,7 @@ static void CFTSetupButton(void) {
 
 __attribute__((constructor)) static void CFT_ctor(void) {
     @autoreleasepool {
+        CFTInstallCrashHandler();
         gScanQueue = dispatch_queue_create("com.counterflame.scan", DISPATCH_QUEUE_SERIAL);
         dispatch_async(dispatch_get_main_queue(), ^{
             CFTCacheScreen();
